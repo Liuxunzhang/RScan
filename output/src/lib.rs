@@ -57,19 +57,26 @@ impl OutputManager {
 
         let path = config.effective_path();
         let format = config.effective_format();
+        let append_mode = config.api_addr.is_none();
 
         ensure_parent_dir(&path)?;
 
         match format {
             OutputFormat::Txt | OutputFormat::Json => {
-                File::create(&path)
+                open_output_file(&path, append_mode)
                     .with_context(|| format!("failed to create {}", path.display()))?;
             }
             OutputFormat::Csv => {
-                let mut writer = csv::Writer::from_path(&path)
+                let should_write_headers = !append_mode || file_is_empty_or_missing(&path)?;
+                let file = open_output_file(&path, append_mode)
                     .with_context(|| format!("failed to create {}", path.display()))?;
-                writer.write_record(["Time", "Type", "Target", "Status", "Details"])?;
-                writer.flush()?;
+                if should_write_headers {
+                    let mut writer = csv::WriterBuilder::new()
+                        .has_headers(false)
+                        .from_writer(file);
+                    writer.write_record(["Time", "Type", "Target", "Status", "Details"])?;
+                    writer.flush()?;
+                }
             }
         }
 
@@ -139,6 +146,25 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn open_output_file(path: &Path, append_mode: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    if append_mode {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    options.open(path).with_context(|| format!("failed to open {}", path.display()))
+}
+
+fn file_is_empty_or_missing(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len() == 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,7 +195,7 @@ mod tests {
         assert_eq!(manager.format, OutputFormat::Csv);
         assert_eq!(
             manager.path().expect("output path should exist"),
-            Path::new("reports/fscanapi.csv")
+            Path::new("reports/rscanapi.csv")
         );
     }
 
@@ -200,6 +226,82 @@ mod tests {
         let content = fs::read_to_string(&path).expect("json output should exist");
         assert!(content.contains("\n  \"time\": \"2025-01-01T00:00:00Z\""));
         assert!(content.ends_with("}\n"));
+
+        fs::remove_file(path).expect("temp output should be removable");
+    }
+
+    #[test]
+    fn appends_json_records_across_initializations_like_go() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rscan-output-append-{unique}.json"));
+
+        for port in [22, 80] {
+            let manager = OutputManager::initialize(&OutputConfig {
+                format: OutputFormat::Json,
+                path: path.clone(),
+                ..OutputConfig::default()
+            })
+            .expect("manager should initialize");
+
+            manager
+                .write_result(&ScanResult {
+                    time: format!("2025-01-01T00:00:{port:02}Z"),
+                    kind: ResultType::Service,
+                    target: "127.0.0.1".to_string(),
+                    status: "identified".to_string(),
+                    details: BTreeMap::from([("port".to_string(), json!(port))]),
+                })
+                .expect("json result should write");
+        }
+
+        let content = fs::read_to_string(&path).expect("json output should exist");
+        let records = serde_json::Deserializer::from_str(&content)
+            .into_iter::<serde_json::Value>()
+            .map(|value| value.expect("json record should parse"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["details"]["port"], json!(22));
+        assert_eq!(records[1]["details"]["port"], json!(80));
+
+        fs::remove_file(path).expect("temp output should be removable");
+    }
+
+    #[test]
+    fn appends_csv_records_without_rewriting_headers() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rscan-output-append-{unique}.csv"));
+
+        for port in [22, 80] {
+            let manager = OutputManager::initialize(&OutputConfig {
+                format: OutputFormat::Csv,
+                path: path.clone(),
+                ..OutputConfig::default()
+            })
+            .expect("manager should initialize");
+
+            manager
+                .write_result(&ScanResult {
+                    time: format!("2025-01-01T00:00:{port:02}Z"),
+                    kind: ResultType::Service,
+                    target: "127.0.0.1".to_string(),
+                    status: "identified".to_string(),
+                    details: BTreeMap::from([("port".to_string(), json!(port))]),
+                })
+                .expect("csv result should write");
+        }
+
+        let content = fs::read_to_string(&path).expect("csv output should exist");
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "Time,Type,Target,Status,Details");
+        assert!(lines[1].contains(",SERVICE,127.0.0.1,identified,"));
+        assert!(lines[2].contains(",SERVICE,127.0.0.1,identified,"));
 
         fs::remove_file(path).expect("temp output should be removable");
     }

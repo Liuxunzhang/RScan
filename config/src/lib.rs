@@ -273,7 +273,7 @@ impl OutputConfig {
                 .parent()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
-            dir.join("fscanapi.csv")
+            dir.join("rscanapi.csv")
         } else {
             self.path.clone()
         }
@@ -858,7 +858,7 @@ pub fn help_text_for(language: &str) -> &'static str {
 Targets:\n\
   -h <host>          Target host/CIDR/range\n\
   -eh <hosts>        Exclude hosts\n\
-  -p <ports>         Ports (default: fscan main ports)\n\
+  -p <ports>         Ports (default: rscan main ports)\n\
   -ep <ports>        Exclude ports\n\
   -hf <file>         Hosts file\n\
   -pf <file>         Ports file\n\
@@ -895,7 +895,7 @@ Output/runtime:\n\
   -pg                Show progress\n\
   -sp                Show scan plan\n\
   -slow              Slow log output\n\
-  -api <addr>        API endpoint; forces csv output to fscanapi.csv\n\
+  -api <addr>        API endpoint; forces csv output to rscanapi.csv\n\
   -secret <key>      API secret key\n\
   -sc <shellcode>    Shellcode option\n\
   -lang <lang>       Language (default: zh)\n\
@@ -903,7 +903,7 @@ Output/runtime:\n\
   -version           Show version\n\
 \n\
 Note: the parser intentionally accepts Go-style single-dash multi-letter flags\n\
-to stay compatible with the current fscan CLI.";
+to stay compatible with the current rscan CLI.";
     }
 
     "用法: rscan [选项]\n\
@@ -911,7 +911,7 @@ to stay compatible with the current fscan CLI.";
 目标:\n\
   -h <host>          目标主机/CIDR/范围\n\
   -eh <hosts>        排除主机\n\
-  -p <ports>         端口 (默认: fscan main ports)\n\
+  -p <ports>         端口 (默认: rscan main ports)\n\
   -ep <ports>        排除端口\n\
   -hf <file>         主机文件\n\
   -pf <file>         端口文件\n\
@@ -948,7 +948,7 @@ to stay compatible with the current fscan CLI.";
   -pg                显示进度\n\
   -sp                显示扫描计划\n\
   -slow              慢速日志输出\n\
-  -api <addr>        API 地址; 会强制输出到 fscanapi.csv\n\
+  -api <addr>        API 地址; 会强制输出到 rscanapi.csv\n\
   -secret <key>      API 密钥\n\
   -sc <shellcode>    Shellcode 选项\n\
   -lang <lang>       语言 (默认: zh)\n\
@@ -956,7 +956,7 @@ to stay compatible with the current fscan CLI.";
   -version           显示版本\n\
 \n\
 说明: 解析器会保留 Go 风格的单横线多字符参数，\n\
-以兼容当前 fscan CLI。"
+以兼容当前 rscan CLI。"
 }
 
 #[cfg(test)]
@@ -1039,7 +1039,7 @@ mod tests {
         assert_eq!(config.output.effective_format(), OutputFormat::Csv);
         assert_eq!(
             config.output.effective_path(),
-            PathBuf::from("reports").join("fscanapi.csv")
+            PathBuf::from("reports").join("rscanapi.csv")
         );
         assert_eq!(
             config.output.api_addr.as_deref(),

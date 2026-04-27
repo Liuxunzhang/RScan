@@ -1,6 +1,6 @@
 # RSCAN
 
-Rust 重写版内网综合扫描工具工作区，目标是**独立复现原 `fscan` 的功能与行为**，但仓库本身**不再依赖原 Go 项目的目录结构或源码路径**。
+Rust 重写版内网综合扫描工具工作区，目标是**独立复现原 Go 版本的功能与行为**，但仓库本身**不再依赖原项目的目录结构或源码路径**。
 
 ## 特性
 
@@ -60,9 +60,9 @@ target/release/rscan
 当前仓库已内置运行所需的兼容资源，包括：
 
 - `fingerprint/assets/nmap-service-probes.txt`
-- `fingerprint/assets/Config.go`
-- `web/assets/Rules.go`
+- `fingerprint/assets/port_map.rs`
+- `web/assets/rules.rs`
 - `poc/embedded-pocs/`
-- `plugins/assets/MS17010-Exp.go`
+- `plugins/assets/ms17010_presets.rs`
 
-因此将本目录单独复制或初始化为新的 Git 仓库后，代码不再依赖外层 `fscan/` 目录。
+因此将本目录单独复制或初始化为新的 Git 仓库后，代码不再依赖外层旧仓库目录。

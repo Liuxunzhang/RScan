@@ -19,7 +19,7 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureSch
 
 const MAX_FAILURES: usize = 10;
 const PROBES_SOURCE: &str = include_str!("../assets/nmap-service-probes.txt");
-const GO_CONFIG_SOURCE: &str = include_str!("../assets/Config.go");
+const PORT_MAP_SOURCE: &str = include_str!("../assets/port_map.rs");
 const GO_FINGERPRINT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const GO_DEFAULT_TCP_PROBES: &[&str] = &[
     "GenericLines",
@@ -434,7 +434,7 @@ fn parse_go_port_map() -> Result<HashMap<u16, Vec<String>>> {
     let mut map = HashMap::new();
     let mut in_port_map = false;
 
-    for line in GO_CONFIG_SOURCE.lines() {
+    for line in PORT_MAP_SOURCE.lines() {
         let trimmed = line.trim();
         if trimmed == "var PortMap = map[int][]string{" {
             in_port_map = true;

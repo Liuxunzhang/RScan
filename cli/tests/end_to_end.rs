@@ -40,6 +40,14 @@ fn read_output_compact(path: &PathBuf) -> String {
     compact
 }
 
+fn read_output_records(path: &PathBuf) -> Vec<serde_json::Value> {
+    let content = fs::read_to_string(path).expect("output file should exist");
+    serde_json::Deserializer::from_str(&content)
+        .into_iter::<serde_json::Value>()
+        .map(|value| value.expect("output should contain valid json records"))
+        .collect()
+}
+
 const TEST_SSH_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
 NhAAAAAwEAAQAAAQEApsV6z4Qb/kgByFhg/Ive9nyAL01i3FOhIeA9VCR+CofpDm3cV/3j\n\
@@ -3117,5 +3125,31 @@ fn runs_named_localinfo_mode_and_writes_service_result() {
     assert!(content.contains(r#""type":"SERVICE""#));
     assert!(content.contains(r#""status":"local-info""#));
     assert!(content.contains(r#""hostname":"#));
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn appends_output_records_across_runs_like_go() {
+    let output = temp_output("append-output");
+
+    for _ in 0..2 {
+        let status = Command::new(env!("CARGO_BIN_EXE_rscan"))
+            .args([
+                "-m",
+                "localinfo",
+                "-f",
+                "json",
+                "-o",
+                output.to_string_lossy().as_ref(),
+            ])
+            .status()
+            .expect("command should run");
+        assert!(status.success());
+    }
+
+    let records = read_output_records(&output);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["status"], "local-info");
+    assert_eq!(records[1]["status"], "local-info");
     let _ = fs::remove_file(output);
 }

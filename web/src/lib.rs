@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; rscan/0.1.0)";
-const RULES_SOURCE: &str = include_str!("../assets/Rules.go");
+const RULES_SOURCE: &str = include_str!("../assets/rules.rs");
 const MAX_TITLE_LENGTH: usize = 100;
 const NO_TITLE_TEXT: &str = "无标题";
 

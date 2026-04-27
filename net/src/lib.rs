@@ -45,12 +45,12 @@ pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
         }
 
         if let Some((start, end)) = item.split_once('-') {
-            let start = start
-                .parse::<u16>()
-                .map_err(|_| anyhow!("invalid port range start: {item}"))?;
-            let end = end
-                .parse::<u16>()
-                .map_err(|_| anyhow!("invalid port range end: {item}"))?;
+            let Ok(start) = start.parse::<u16>() else {
+                continue;
+            };
+            let Ok(end) = end.parse::<u16>() else {
+                continue;
+            };
             let (from, to) = if start <= end {
                 (start, end)
             } else {
@@ -63,9 +63,9 @@ pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
                 }
             }
         } else {
-            let port = item
-                .parse::<u16>()
-                .map_err(|_| anyhow!("invalid port: {item}"))?;
+            let Ok(port) = item.parse::<u16>() else {
+                continue;
+            };
             if port != 0 {
                 ports.insert(port);
             }
@@ -518,6 +518,12 @@ mod tests {
         assert!(ports.contains(&21));
         assert!(ports.contains(&18080));
         assert!(ports.contains(&10086));
+    }
+
+    #[test]
+    fn skips_invalid_port_tokens_like_go() {
+        let ports = parse_ports("80,abc,70000,10-12,1-x,0,443").expect("ports should parse");
+        assert_eq!(ports, vec![10, 11, 12, 80, 443]);
     }
 
     #[test]

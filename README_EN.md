@@ -1,6 +1,6 @@
 # RSCAN
 
-RSCAN is a Rust workspace intended to **standalone-reimplement the original `fscan` feature set and behavior** without depending on the original Go repository layout.
+RSCAN is a Rust workspace intended to **standalone-reimplement the original Go feature set and behavior** without depending on the original repository layout.
 
 ## Features
 
@@ -60,9 +60,9 @@ Show full help:
 The workspace now vendors the compatibility resources it needs:
 
 - `fingerprint/assets/nmap-service-probes.txt`
-- `fingerprint/assets/Config.go`
-- `web/assets/Rules.go`
+- `fingerprint/assets/port_map.rs`
+- `web/assets/rules.rs`
 - `poc/embedded-pocs/`
-- `plugins/assets/MS17010-Exp.go`
+- `plugins/assets/ms17010_presets.rs`
 
-That means this directory can be copied out or initialized as its own Git repository without requiring the outer `fscan/` tree.
+That means this directory can be copied out or initialized as its own Git repository without requiring the outer legacy repository tree.

@@ -369,7 +369,7 @@ mod minidump {
         let pid = find_process_id("lsass.exe")?;
         enable_debug_privilege()?;
 
-        let output_path = PathBuf::from(format!("fscan-{pid}.dmp"));
+        let output_path = PathBuf::from(format!("rscan-{pid}.dmp"));
         write_minidump(pid, &output_path)?;
 
         Ok(Some(MiniDumpInfo {
