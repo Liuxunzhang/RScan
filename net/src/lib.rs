@@ -557,7 +557,8 @@ mod tests {
 
     #[test]
     fn expands_large_full_ranges_without_error() {
-        let hosts = expand_targets(&["10.0.0.0-10.1.0.0".to_string()]).expect("range should expand");
+        let hosts =
+            expand_targets(&["10.0.0.0-10.1.0.0".to_string()]).expect("range should expand");
         assert_eq!(hosts.len(), 65_537);
         assert_eq!(hosts.first().map(String::as_str), Some("10.0.0.0"));
         assert_eq!(hosts.last().map(String::as_str), Some("10.1.0.0"));

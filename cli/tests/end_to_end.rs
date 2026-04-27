@@ -1,3 +1,5 @@
+use rustls::pki_types::PrivateKeyDer;
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use std::fs;
 use std::io::BufReader;
 use std::io::ErrorKind;
@@ -7,8 +9,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use rustls::pki_types::PrivateKeyDer;
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
 fn temp_output(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("rscan-e2e-{}-{}.json", name, std::process::id()));
@@ -135,12 +135,14 @@ fn tls_test_config() -> Arc<ServerConfig> {
             .expect("TLS key should parse")
             .expect("TLS key should exist");
         Arc::new(
-            ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
-                .with_safe_default_protocol_versions()
-                .expect("TLS protocol versions should be available")
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .expect("TLS server config should build"),
+            ServerConfig::builder_with_provider(
+                rustls::crypto::aws_lc_rs::default_provider().into(),
+            )
+            .with_safe_default_protocol_versions()
+            .expect("TLS protocol versions should be available")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("TLS server config should build"),
         )
     }))
 }
@@ -2135,7 +2137,10 @@ fn skips_snmp_plugin_without_explicit_hostport_like_go() {
     let err = socket
         .recv_from(&mut buffer)
         .expect_err("snmp request should not be sent");
-    assert!(matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut));
+    assert!(matches!(
+        err.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut
+    ));
     assert!(!content.contains(r#""service":"snmp""#));
     assert!(!content.contains(r#""type":"weak-community""#));
     let _ = fs::remove_file(output);

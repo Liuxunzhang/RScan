@@ -6,9 +6,9 @@ use rscan_output::{ResultType, ScanResult};
 use rscan_platform::{collect_dc_info, collect_local_system_info, collect_minidump};
 use rscan_plugins::{
     AuthRuntimeOptions, ConnectionRuntimeOptions, Ms17010RuntimeOptions, OpenService,
-    PluginContext, RedisRuntimeOptions, ServiceScanRuntimeOptions, scan_services,
-    select_plugins, set_auth_runtime_options, set_connection_runtime_options,
-    set_ms17010_runtime_options, set_redis_runtime_options, set_service_scan_runtime_options,
+    PluginContext, RedisRuntimeOptions, ServiceScanRuntimeOptions, scan_services, select_plugins,
+    set_auth_runtime_options, set_connection_runtime_options, set_ms17010_runtime_options,
+    set_redis_runtime_options, set_service_scan_runtime_options,
 };
 use rscan_poc::{
     PocExecutionOptions, execute_pocs, filter_pocs, load_embedded_pocs, load_pocs_from_path,
@@ -163,12 +163,13 @@ impl Application {
         } else {
             Vec::new()
         };
-        results.extend(fingerprint_results.iter().map(build_fingerprint_scan_result));
-        let service_plugin_defs = select_plugins(&mode);
-        let service_targets = build_service_targets(
-            &mode,
-            &open_ports,
+        results.extend(
+            fingerprint_results
+                .iter()
+                .map(build_fingerprint_scan_result),
         );
+        let service_plugin_defs = select_plugins(&mode);
+        let service_targets = build_service_targets(&mode, &open_ports);
         let service_findings = if service_plugin_defs.is_empty() || service_targets.is_empty() {
             Vec::new()
         } else {
@@ -230,7 +231,8 @@ impl Application {
             status: finding.status,
             details: finding.details,
         }));
-        let selected_plugin_count = service_plugin_defs.len() + local_modules.len() + web_modules.len();
+        let selected_plugin_count =
+            service_plugin_defs.len() + local_modules.len() + web_modules.len();
         let local_results = build_local_results(&local_modules)?;
         let local_result_count = local_results.len();
         results.extend(local_results);
@@ -256,15 +258,16 @@ impl Application {
             web_results
                 .iter()
                 .map(|target| {
-                    let target_pocs = select_pocs_for_web_result(
-                        &available_pocs,
-                        target,
-                        explicit_poc_name,
-                    );
+                    let target_pocs =
+                        select_pocs_for_web_result(&available_pocs, target, explicit_poc_name);
                     if target_pocs.is_empty() {
                         Ok(Vec::new())
                     } else {
-                        execute_pocs(&normalize_poc_target(&target.final_url), &target_pocs, &options)
+                        execute_pocs(
+                            &normalize_poc_target(&target.final_url),
+                            &target_pocs,
+                            &options,
+                        )
                     }
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -357,8 +360,8 @@ impl Application {
         }
         let mode = self.config.scan.mode.to_string();
         let web_modules = selected_web_modules(&mode);
-        let implicit_web_pocs = mode == "all"
-            || web_modules.iter().any(|module| module == "webpoc");
+        let implicit_web_pocs =
+            mode == "all" || web_modules.iter().any(|module| module == "webpoc");
         if !self.config.poc.full && self.config.poc.poc_name.is_none() && !implicit_web_pocs {
             return Ok(Vec::new());
         }
@@ -853,10 +856,7 @@ fn build_web_targets(
     Ok(targets)
 }
 
-fn build_service_targets(
-    mode: &str,
-    open_ports: &[rscan_net::OpenPort],
-) -> Vec<OpenService> {
+fn build_service_targets(mode: &str, open_ports: &[rscan_net::OpenPort]) -> Vec<OpenService> {
     let mut seen = BTreeSet::new();
     let mut targets = Vec::new();
 
@@ -963,9 +963,7 @@ fn web_authority_host(url: &str) -> Option<String> {
         return None;
     }
     if authority.starts_with('[') {
-        return authority
-            .find(']')
-            .map(|end| authority[..=end].to_string());
+        return authority.find(']').map(|end| authority[..=end].to_string());
     }
     Some(
         authority
@@ -980,10 +978,7 @@ fn normalize_poc_target(url: &str) -> String {
     let Some((scheme, remainder)) = url.split_once("://") else {
         return url.to_string();
     };
-    let authority = remainder
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(remainder);
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or(remainder);
     format!("{scheme}://{authority}")
 }
 
@@ -1138,7 +1133,10 @@ mod tests {
         assert_eq!(report.summary.web_target_count, 1);
         assert_eq!(report.summary.web_result_count, 1);
         assert_eq!(report.results[0].status, "identified");
-        assert_eq!(report.results[0].details["title"], json!("HTTPS URL Fallback"));
+        assert_eq!(
+            report.results[0].details["title"],
+            json!("HTTPS URL Fallback")
+        );
         assert_eq!(
             report.results[0].details["Url"],
             json!(format!("http://127.0.0.1:{port}/"))
@@ -1252,8 +1250,15 @@ mod tests {
         });
 
         let report = Application::new(
-            AppConfig::from_tokens(["-h", "127.0.0.1", "-p", &port.to_string(), "-m", "memcached"])
-                .expect("config should parse"),
+            AppConfig::from_tokens([
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "memcached",
+            ])
+            .expect("config should parse"),
         )
         .run()
         .expect("scan should run");
@@ -1263,10 +1268,9 @@ mod tests {
         assert_eq!(report.summary.selected_plugin_count, 1);
         assert_eq!(report.summary.web_target_count, 0);
         assert_eq!(report.summary.web_result_count, 0);
-        assert!(!report
-            .results
-            .iter()
-            .any(|result| result.kind == ResultType::Service && result.details.contains_key("title")));
+        assert!(!report.results.iter().any(
+            |result| result.kind == ResultType::Service && result.details.contains_key("title")
+        ));
     }
 
     #[test]
@@ -1339,10 +1343,7 @@ mod tests {
         use std::thread;
         use std::{env, fs};
 
-        let root = env::temp_dir().join(format!(
-            "rscan-core-poc-origin-{}",
-            std::process::id()
-        ));
+        let root = env::temp_dir().join(format!("rscan-core-poc-origin-{}", std::process::id()));
         fs::create_dir_all(&root).expect("temp poc dir should exist");
         fs::write(
             root.join("origin.yaml"),
@@ -1606,7 +1607,9 @@ mod tests {
 
         let server = thread::spawn(move || {
             let _ = listener.accept().expect("port probe should arrive");
-            let (mut stream, _) = listener.accept().expect("fingerprint connection should arrive");
+            let (mut stream, _) = listener
+                .accept()
+                .expect("fingerprint connection should arrive");
             thread::sleep(Duration::from_secs(4));
             stream
                 .write_all(b"SSH-2.0-OpenSSH_9.6\r\n")
@@ -1916,10 +1919,8 @@ mod tests {
         use std::thread;
         use std::{env, fs};
 
-        let root = env::temp_dir().join(format!(
-            "rscan-core-webpoc-default-{}",
-            std::process::id()
-        ));
+        let root =
+            env::temp_dir().join(format!("rscan-core-webpoc-default-{}", std::process::id()));
         fs::create_dir_all(&root).expect("temp poc dir should exist");
         fs::write(
             root.join("custom.yaml"),
@@ -2238,7 +2239,9 @@ mod tests {
                                 .write_all(b"STAT pid 1\r\nEND\r\n")
                                 .expect("response should write");
                         } else if request.starts_with("info") || request.starts_with("INFO") {
-                            stream.write_all(b"ERROR\r\n").expect("response should write");
+                            stream
+                                .write_all(b"ERROR\r\n")
+                                .expect("response should write");
                         } else {
                             stream
                                 .write_all(b"VERSION 1.6.9\r\n")
@@ -2374,9 +2377,11 @@ mod tests {
                 && result.status == "unauthorized-access"
                 && result.details["service"] == json!("memcached")
         }));
-        assert!(report.results.iter().any(|result| {
-            result.kind == ResultType::Service && result.status == "local-info"
-        }));
+        assert!(
+            report.results.iter().any(|result| {
+                result.kind == ResultType::Service && result.status == "local-info"
+            })
+        );
     }
 
     #[test]

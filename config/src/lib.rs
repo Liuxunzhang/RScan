@@ -78,7 +78,11 @@ impl Display for ScanMode {
 
 pub fn parse_scan_mode_list(mode: &str) -> Vec<String> {
     let mut parsed = Vec::new();
-    for item in mode.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for item in mode
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         let item = item.to_string();
         if !parsed.contains(&item) {
             parsed.push(item);
@@ -806,7 +810,11 @@ fn append_target_specs(
     host_ports: &mut Vec<String>,
     value: &str,
 ) -> Result<(), ConfigError> {
-    for item in value.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         append_target_spec(hosts, host_ports, item)?;
     }
     Ok(())
@@ -1212,10 +1220,15 @@ mod tests {
     #[test]
     fn validates_single_runtime_mode() {
         let config = AppConfig::from_tokens(["-h", "10.0.0.1"]).expect("config should parse");
-        config.validate_run_mode().expect("single host mode should pass");
+        config
+            .validate_run_mode()
+            .expect("single host mode should pass");
 
-        let config = AppConfig::from_tokens(["-u", "http://127.0.0.1"]).expect("config should parse");
-        config.validate_run_mode().expect("single url mode should pass");
+        let config =
+            AppConfig::from_tokens(["-u", "http://127.0.0.1"]).expect("config should parse");
+        config
+            .validate_run_mode()
+            .expect("single url mode should pass");
 
         let config = AppConfig::from_tokens(["-local"]).expect("config should parse");
         config.validate_run_mode().expect("local mode should pass");
@@ -1243,8 +1256,8 @@ mod tests {
             .validate_run_mode()
             .expect("host and url should be allowed like go");
 
-        let config = AppConfig::from_tokens(["-h", "10.0.0.1", "-local"])
-            .expect("config should parse");
+        let config =
+            AppConfig::from_tokens(["-h", "10.0.0.1", "-local"]).expect("config should parse");
         let error = config
             .validate_run_mode()
             .expect_err("host and local should conflict");

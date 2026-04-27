@@ -154,7 +154,9 @@ fn open_output_file(path: &Path, append_mode: bool) -> Result<File> {
     } else {
         options.truncate(true);
     }
-    options.open(path).with_context(|| format!("failed to open {}", path.display()))
+    options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))
 }
 
 fn file_is_empty_or_missing(path: &Path) -> Result<bool> {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use regex::bytes::{Captures, Regex, RegexBuilder};
 use regex::Regex as TextRegex;
+use regex::bytes::{Captures, Regex, RegexBuilder};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -9,9 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 #[cfg(test)]
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 #[cfg(test)]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(test)]
@@ -19,7 +17,6 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureSch
 
 const MAX_FAILURES: usize = 10;
 const PROBES_SOURCE: &str = include_str!("../assets/nmap-service-probes.txt");
-const PORT_MAP_SOURCE: &str = include_str!("../assets/port_map.rs");
 const GO_FINGERPRINT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 const GO_DEFAULT_TCP_PROBES: &[&str] = &[
     "GenericLines",
@@ -33,6 +30,10 @@ const GO_DEFAULT_TCP_PROBES: &[&str] = &[
     "oracle-tns",
     "Socks5",
 ];
+
+mod port_map_asset {
+    include!("../assets/port_map.rs");
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceFingerprintTarget {
@@ -294,13 +295,13 @@ fn parse_probe_database() -> Result<ProbeDatabase> {
         .collect::<Vec<_>>();
 
     let mut go_port_map: HashMap<u16, Vec<usize>> = HashMap::new();
-    for (port, names) in parse_go_port_map()? {
+    for (port, names) in port_map_asset::PORT_MAP {
         let mapped = names
-            .into_iter()
-            .filter_map(|name| probes_by_name.get(&name).copied())
+            .iter()
+            .filter_map(|name| probes_by_name.get(*name).copied())
             .collect::<Vec<_>>();
         if !mapped.is_empty() {
-            go_port_map.insert(port, mapped);
+            go_port_map.insert(*port, mapped);
         }
     }
 
@@ -426,39 +427,6 @@ fn parse_port_ranges(spec: &str) -> Result<Vec<PortRange>> {
         }
     }
     Ok(ranges)
-}
-
-fn parse_go_port_map() -> Result<HashMap<u16, Vec<String>>> {
-    static NAME_RE: OnceLock<TextRegex> = OnceLock::new();
-
-    let mut map = HashMap::new();
-    let mut in_port_map = false;
-
-    for line in PORT_MAP_SOURCE.lines() {
-        let trimmed = line.trim();
-        if trimmed == "var PortMap = map[int][]string{" {
-            in_port_map = true;
-            continue;
-        }
-        if !in_port_map {
-            continue;
-        }
-        if trimmed == "}" {
-            break;
-        }
-        let Some((port, rest)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let port = port.trim().parse::<u16>()?;
-        let names = NAME_RE
-            .get_or_init(|| TextRegex::new(r#""([^"]+)""#).expect("port map regex should compile"))
-            .captures_iter(rest)
-            .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()))
-            .collect::<Vec<_>>();
-        map.insert(port, names);
-    }
-
-    Ok(map)
 }
 
 fn decode_pattern(pattern: &str) -> Result<String> {
@@ -828,7 +796,9 @@ fn match_probe_response(
         "GenericLines" => {
             if let Some(index) = database.probes_by_name.get("NULL").copied() {
                 used.insert("NULL".to_string());
-                if let Some(result) = match_probe(target, &database.probes[index], response, database) {
+                if let Some(result) =
+                    match_probe(target, &database.probes[index], response, database)
+                {
                     return Some(result);
                 }
             }
@@ -837,7 +807,8 @@ fn match_probe_response(
         _ => {
             if let Some(index) = database.probes_by_name.get("GenericLines").copied() {
                 used.insert("GenericLines".to_string());
-                if let Some(result) = match_probe(target, &database.probes[index], response, database)
+                if let Some(result) =
+                    match_probe(target, &database.probes[index], response, database)
                 {
                     return Some(result);
                 }
@@ -1106,8 +1077,8 @@ mod tests {
     use rustls::{ServerConfig, ServerConnection, StreamOwned};
     use std::io::{BufReader, ErrorKind};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     const TEST_TLS_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
@@ -1175,9 +1146,9 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                 )
                 .with_safe_default_protocol_versions()
                 .expect("TLS protocol versions should be available")
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)
-                    .expect("TLS server config should build"),
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .expect("TLS server config should build"),
             )
         }))
     }
@@ -1256,8 +1227,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
                         if tls.conn.complete_io(&mut tls.sock).is_err() {
                             continue;
@@ -1309,8 +1280,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
                         if tls.conn.complete_io(&mut tls.sock).is_err() {
                             continue;
@@ -1774,7 +1745,9 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                     Ok(count) => {
                         seen.extend_from_slice(&buf[..count]);
                         if seen.windows(4).any(|window| window == b"\r\n\r\n") {
-                            stream.write_all(b"ERROR\r\n").expect("probe reply should write");
+                            stream
+                                .write_all(b"ERROR\r\n")
+                                .expect("probe reply should write");
                             break;
                         }
                     }
@@ -1860,10 +1833,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             .map(|index| database.probes[*index].name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            &names[..GO_DEFAULT_TCP_PROBES.len()],
-            GO_DEFAULT_TCP_PROBES
-        );
+        assert_eq!(&names[..GO_DEFAULT_TCP_PROBES.len()], GO_DEFAULT_TCP_PROBES);
     }
 
     #[test]

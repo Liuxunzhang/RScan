@@ -27,13 +27,19 @@ fn main() -> Result<()> {
     }
 
     if let Err(error) = config.validate_run_mode() {
-        eprintln!("error: {error}\n\n{}", help_text_for(&config.runtime.language));
+        eprintln!(
+            "error: {error}\n\n{}",
+            help_text_for(&config.runtime.language)
+        );
         std::process::exit(2);
     }
 
     let app = Application::new(config.clone());
     if let Err(error) = app.validate_mode_selection() {
-        eprintln!("error: {error}\n\n{}", help_text_for(&config.runtime.language));
+        eprintln!(
+            "error: {error}\n\n{}",
+            help_text_for(&config.runtime.language)
+        );
         std::process::exit(2);
     }
     if config.output.show_scan_plan {

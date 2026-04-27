@@ -9,9 +9,12 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; rscan/0.1.0)";
-const RULES_SOURCE: &str = include_str!("../assets/rules.rs");
 const MAX_TITLE_LENGTH: usize = 100;
 const NO_TITLE_TEXT: &str = "无标题";
+
+mod rules_asset {
+    include!("../assets/rules.rs");
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebScanResult {
@@ -45,7 +48,11 @@ pub fn scan_target(target: &str, config: &WebConfig) -> Result<WebScanResult> {
     for (index, candidate) in candidates.iter().enumerate() {
         match fetch_target(&client, target, &candidate, config.cookie.as_deref()) {
             Ok(result) => {
-                if should_retry_http_400_as_https(candidate, result.status_code, &candidates[..index]) {
+                if should_retry_http_400_as_https(
+                    candidate,
+                    result.status_code,
+                    &candidates[..index],
+                ) {
                     let https_target = candidate.replacen("http://", "https://", 1);
                     match fetch_target(&client, target, &https_target, config.cookie.as_deref()) {
                         Ok(upgraded) => return Ok(upgraded),
@@ -68,7 +75,9 @@ fn should_retry_http_400_as_https(
 ) -> bool {
     status_code == 400
         && candidate.starts_with("http://")
-        && !prior_candidates.iter().any(|prior| prior.starts_with("https://"))
+        && !prior_candidates
+            .iter()
+            .any(|prior| prior.starts_with("https://"))
 }
 
 fn build_client(config: &WebConfig) -> Result<Client> {
@@ -218,7 +227,10 @@ fn match_fingerprint_responses(
 ) -> Vec<String> {
     let mut matches = BTreeSet::new();
 
-    for response in prior_responses.iter().chain(std::iter::once(final_response)) {
+    for response in prior_responses
+        .iter()
+        .chain(std::iter::once(final_response))
+    {
         for fingerprint in match_fingerprints(&response.body_text, &response.headers) {
             matches.insert(fingerprint);
         }
@@ -297,18 +309,17 @@ fn poc_alias_rules() -> &'static [PocAliasRule] {
 }
 
 fn parse_rules() -> Vec<FingerprintRule> {
-    RULES_SOURCE
-        .lines()
-        .filter_map(parse_rule_line)
+    rules_asset::RULES
+        .iter()
         .filter_map(|(name, kind, rule)| {
-            let location = match kind.as_str() {
+            let location = match *kind {
                 "code" | "index" => MatchLocation::Body,
                 "headers" | "header" | "cookie" => MatchLocation::Headers,
                 _ => return None,
             };
-            let regex = Regex::new(&rule).ok()?;
+            let regex = Regex::new(rule).ok()?;
             Some(FingerprintRule {
-                name,
+                name: (*name).to_string(),
                 location,
                 regex,
             })
@@ -317,77 +328,13 @@ fn parse_rules() -> Vec<FingerprintRule> {
 }
 
 fn parse_poc_alias_rules() -> Vec<PocAliasRule> {
-    let mut in_section = false;
-    let mut mappings = Vec::new();
-
-    for line in RULES_SOURCE.lines() {
-        let trimmed = line.trim();
-        if !in_section {
-            if trimmed.starts_with("var PocDatas = []PocData{") {
-                in_section = true;
-            }
-            continue;
-        }
-
-        if trimmed == "}" {
-            break;
-        }
-
-        if let Some(mapping) = parse_poc_alias_line(trimmed) {
-            mappings.push(mapping);
-        }
-    }
-
-    mappings
-}
-
-fn parse_rule_line(line: &str) -> Option<(String, String, String)> {
-    static QUOTED: OnceLock<Regex> = OnceLock::new();
-    static RAW: OnceLock<Regex> = OnceLock::new();
-    let trimmed = line.trim();
-    if !trimmed.starts_with("{\"") {
-        return None;
-    }
-
-    let quoted = QUOTED.get_or_init(|| {
-        Regex::new(r#"^\{"([^"]+)",\s*"([^"]+)",\s*"((?:[^"\\]|\\.)*)"\},?$"#)
-            .expect("quoted rule regex")
-    });
-    if let Some(captures) = quoted.captures(trimmed) {
-        return Some((
-            captures[1].to_string(),
-            captures[2].to_string().to_ascii_lowercase(),
-            unescape_go_string(&captures[3]),
-        ));
-    }
-
-    let raw = RAW.get_or_init(|| {
-        Regex::new(r#"^\{"([^"]+)",\s*"([^"]+)",\s*`([^`]*)`\},?$"#).expect("raw rule regex")
-    });
-    raw.captures(trimmed).map(|captures| {
-        (
-            captures[1].to_string(),
-            captures[2].to_string().to_ascii_lowercase(),
-            captures[3].to_string(),
-        )
-    })
-}
-
-fn parse_poc_alias_line(line: &str) -> Option<PocAliasRule> {
-    static QUOTED: OnceLock<Regex> = OnceLock::new();
-    let captures = QUOTED
-        .get_or_init(|| {
-            Regex::new(r#"^\{"([^"]+)",\s*"([^"]+)"\},?$"#).expect("poc alias regex")
+    rules_asset::POC_ALIASES
+        .iter()
+        .map(|(name, alias)| PocAliasRule {
+            name: (*name).to_string(),
+            alias: (*alias).to_string(),
         })
-        .captures(line)?;
-    Some(PocAliasRule {
-        name: captures[1].to_string(),
-        alias: captures[2].to_string(),
-    })
-}
-
-fn unescape_go_string(value: &str) -> String {
-    value.replace("\\\"", "\"").replace("\\\\", "\\")
+        .collect()
 }
 
 #[derive(Debug)]
@@ -582,7 +529,9 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             let mut plain_buffer = [0u8; 1024];
             let _ = plain.read(&mut plain_buffer);
             plain
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .expect("http 400 should write");
 
             let (stream, _) = listener.accept().expect("https request should arrive");
@@ -687,7 +636,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
 
     #[test]
     fn maps_fingerprints_to_poc_aliases_like_go() {
-        let aliases = poc_aliases_for_fingerprints(&["weblogic".to_string(), "RabbitMQ".to_string()]);
+        let aliases =
+            poc_aliases_for_fingerprints(&["weblogic".to_string(), "RabbitMQ".to_string()]);
         assert!(aliases.iter().any(|alias| alias == "weblogic"));
         assert!(!aliases.iter().any(|alias| alias == "RabbitMQ"));
     }
