@@ -285,7 +285,7 @@ fn fingerprint_target_with_transport(
     }
 
     Ok(provisional.or_else(|| {
-        reached_target.then(|| unknown_result(target, last_banner.unwrap_or_default()))
+        reached_target.then(|| unmatched_result(target, last_banner.unwrap_or_default()))
     }))
 }
 
@@ -1059,23 +1059,12 @@ fn extract_delimited_field(version_info: &str, token: &str) -> Option<String> {
 }
 
 fn identify_manual_response(
-    target: &ServiceFingerprintTarget,
+    _target: &ServiceFingerprintTarget,
     response: &[u8],
 ) -> Option<ServiceFingerprint> {
     let banner = trim_banner(response);
     if banner.is_empty() {
         return None;
-    }
-
-    if banner.contains("HTTP/") || banner.contains("html") {
-        return Some(ServiceFingerprint {
-            host: target.host.clone(),
-            port: target.port,
-            service: "http".to_string(),
-            version: None,
-            banner,
-            extras: BTreeMap::new(),
-        });
     }
 
     None
@@ -1096,6 +1085,21 @@ fn unknown_result(target: &ServiceFingerprintTarget, banner: String) -> ServiceF
         version: None,
         banner,
         extras: BTreeMap::new(),
+    }
+}
+
+fn unmatched_result(target: &ServiceFingerprintTarget, banner: String) -> ServiceFingerprint {
+    if banner.contains("HTTP/") || banner.contains("html") {
+        ServiceFingerprint {
+            host: target.host.clone(),
+            port: target.port,
+            service: "http".to_string(),
+            version: None,
+            banner,
+            extras: BTreeMap::new(),
+        }
+    } else {
+        unknown_result(target, banner)
     }
 }
 
@@ -1598,6 +1602,52 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].service, "http");
         assert_eq!(matches[0].banner, "<html><title>hello</title></html>.");
+    }
+
+    #[test]
+    fn does_not_stop_after_html_banner_when_later_probe_finds_service() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("connection should arrive");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout should set");
+            stream
+                .write_all(b"<html><title>hello</title></html>\r\n")
+                .expect("initial banner should write");
+
+            let mut seen = Vec::new();
+            loop {
+                let mut request = [0u8; 1024];
+                let count = stream.read(&mut request).expect("probe should arrive");
+                seen.extend_from_slice(&request[..count]);
+                if String::from_utf8_lossy(&seen).contains("GET / HTTP/1.0") {
+                    break;
+                }
+            }
+
+            stream
+                .write_all(b"ERROR\r\n")
+                .expect("probe response should write");
+        });
+
+        let matches = fingerprint_services(
+            &[ServiceFingerprintTarget {
+                host: "127.0.0.1".to_string(),
+                port,
+            }],
+            Duration::from_secs(1),
+            1,
+        )
+        .expect("fingerprint should succeed");
+
+        server.join().expect("server should finish");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].service, "achat");
+        assert_eq!(matches[0].banner, "ERROR.");
     }
 
     #[test]
