@@ -1,17 +1,21 @@
 use anyhow::{Context, Result};
 use regex::bytes::{Captures, Regex, RegexBuilder};
 use regex::Regex as TextRegex;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned,
-};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+
+#[cfg(test)]
+use rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+#[cfg(test)]
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(test)]
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 
 const MAX_FAILURES: usize = 10;
 const PROBES_SOURCE: &str = include_str!("../assets/nmap-service-probes.txt");
@@ -49,7 +53,6 @@ pub struct ServiceFingerprint {
 #[derive(Debug, Clone)]
 struct Probe {
     name: String,
-    protocol: String,
     data: Vec<u8>,
     ports: Vec<PortRange>,
     ssl_ports: Vec<PortRange>,
@@ -79,18 +82,13 @@ struct ProbeDatabase {
     probes_by_name: HashMap<String, usize>,
     default_tcp_probes: Vec<usize>,
     go_port_map: HashMap<u16, Vec<usize>>,
-    tls_ports: HashSet<u16>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FingerprintTransport {
-    Plain,
-    Tls,
-}
-
+#[cfg(test)]
 #[derive(Debug)]
 struct NoCertificateVerification;
 
+#[cfg(test)]
 impl ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
@@ -186,34 +184,19 @@ fn fingerprint_target(
     timeout: Duration,
 ) -> Result<Option<ServiceFingerprint>> {
     let database = probe_database()?;
-    if let Some(result) = fingerprint_target_with_transport(
-        target,
-        timeout,
-        database,
-        FingerprintTransport::Plain,
-    )? {
-        return Ok(Some(result));
-    }
-
-    if database.prefers_tls(target.port) {
-        return fingerprint_target_with_transport(target, timeout, database, FingerprintTransport::Tls);
-    }
-
-    Ok(None)
+    fingerprint_target_with_transport(target, timeout, database)
 }
 
 fn fingerprint_target_with_transport(
     target: &ServiceFingerprintTarget,
     timeout: Duration,
     database: &ProbeDatabase,
-    transport: FingerprintTransport,
 ) -> Result<Option<ServiceFingerprint>> {
     let mut used = HashSet::new();
-    let mut provisional = None;
     let mut last_banner = None;
     let mut reached_target = false;
     let mut plain_stream = None;
-    let initial = match read_initial_banner(target, timeout, transport, &mut plain_stream) {
+    let initial = match read_initial_banner(target, timeout, &mut plain_stream) {
         Ok(response) => {
             reached_target = true;
             response
@@ -223,11 +206,7 @@ fn fingerprint_target_with_transport(
     if !initial.is_empty() {
         last_banner = Some(trim_banner(&initial));
         if let Some(result) = match_banner_response(target, &initial, database, &mut used) {
-            if is_generic_tls_result(&result, transport) {
-                provisional = Some(result);
-            } else {
-                return Ok(Some(result));
-            }
+            return Ok(Some(result));
         }
         if let Some(result) = identify_manual_response(target, &initial) {
             return Ok(Some(result));
@@ -242,13 +221,7 @@ fn fingerprint_target_with_transport(
         }
 
         let probe_timeout = probe_timeout(timeout, probe.total_wait_ms);
-        let response = match execute_probe(
-            target,
-            probe,
-            probe_timeout,
-            transport,
-            &mut plain_stream,
-        ) {
+        let response = match execute_probe(target, probe, probe_timeout, &mut plain_stream) {
             Ok(response) => {
                 reached_target = true;
                 response
@@ -265,28 +238,18 @@ fn fingerprint_target_with_transport(
         last_banner = Some(trim_banner(&response));
 
         if let Some(result) = match_probe_response(target, probe, &response, database, &mut used) {
-            if is_generic_tls_result(&result, transport) {
-                provisional.get_or_insert(result);
-            } else {
-                return Ok(Some(result));
-            }
+            return Ok(Some(result));
         }
         if GO_DEFAULT_TCP_PROBES.contains(&probe.name.as_str()) {
             if let Some(result) =
                 match_mapped_probe_response(target, probe, &response, database, &mut used)
             {
-                if is_generic_tls_result(&result, transport) {
-                    provisional.get_or_insert(result);
-                } else {
-                    return Ok(Some(result));
-                }
+                return Ok(Some(result));
             }
         }
     }
 
-    Ok(provisional.or_else(|| {
-        reached_target.then(|| unmatched_result(target, last_banner.unwrap_or_default()))
-    }))
+    Ok(reached_target.then(|| unmatched_result(target, last_banner.unwrap_or_default())))
 }
 
 fn probe_database() -> Result<&'static ProbeDatabase> {
@@ -330,25 +293,7 @@ fn parse_probe_database() -> Result<ProbeDatabase> {
         .filter_map(|name| probes_by_name.get(*name).copied())
         .collect::<Vec<_>>();
 
-    let mut port_map: HashMap<u16, Vec<usize>> = HashMap::new();
     let mut go_port_map: HashMap<u16, Vec<usize>> = HashMap::new();
-    let mut tls_ports = HashSet::new();
-    for (index, probe) in probes.iter().enumerate() {
-        if !probe.protocol.eq_ignore_ascii_case("tcp") {
-            continue;
-        }
-        for range in &probe.ports {
-            for port in range.start..=range.end {
-                port_map.entry(port).or_default().push(index);
-            }
-        }
-        for range in &probe.ssl_ports {
-            for port in range.start..=range.end {
-                tls_ports.insert(port);
-                port_map.entry(port).or_default().push(index);
-            }
-        }
-    }
     for (port, names) in parse_go_port_map()? {
         let mapped = names
             .into_iter()
@@ -364,7 +309,6 @@ fn parse_probe_database() -> Result<ProbeDatabase> {
         probes_by_name,
         default_tcp_probes,
         go_port_map,
-        tls_ports,
     })
 }
 
@@ -375,7 +319,7 @@ fn parse_probe_block(lines: &[String]) -> Result<Probe> {
     let header = header
         .strip_prefix("Probe ")
         .context("probe block header must start with Probe")?;
-    let (protocol, remainder) = header
+    let (_protocol, remainder) = header
         .split_once(' ')
         .context("probe header missing protocol separator")?;
     let (name, remainder) = remainder
@@ -385,7 +329,6 @@ fn parse_probe_block(lines: &[String]) -> Result<Probe> {
 
     let mut probe = Probe {
         name: name.to_string(),
-        protocol: protocol.to_string(),
         data: decode_data(payload)?,
         ports: Vec::new(),
         ssl_ports: Vec::new(),
@@ -682,45 +625,21 @@ fn push_literal_byte(output: &mut String, byte: u8) {
 fn read_initial_banner(
     target: &ServiceFingerprintTarget,
     timeout: Duration,
-    transport: FingerprintTransport,
     plain_stream: &mut Option<TcpStream>,
 ) -> Result<Vec<u8>> {
-    match transport {
-        FingerprintTransport::Plain => {
-            let stream = ensure_plain_stream(target, timeout, plain_stream)?;
-            read_available(stream)
-        }
-        FingerprintTransport::Tls => {
-            let mut stream = connect_tls_stream(&target.host, target.port, timeout)?;
-            read_available(&mut stream)
-        }
-    }
+    let stream = ensure_plain_stream(target, timeout, plain_stream)?;
+    read_available(stream)
 }
 
 fn execute_probe(
     target: &ServiceFingerprintTarget,
     probe: &Probe,
     timeout: Duration,
-    transport: FingerprintTransport,
     plain_stream: &mut Option<TcpStream>,
 ) -> Result<Vec<u8>> {
-    match transport {
-        FingerprintTransport::Plain => {
-            let stream = write_plain_probe(target, timeout, plain_stream, &probe.data)
-                .with_context(|| format!("failed to write probe {}", probe.name))?;
-            read_available(stream)
-        }
-        FingerprintTransport::Tls => {
-            let mut stream = connect_tls_stream(&target.host, target.port, timeout)?;
-            stream
-                .write_all(&probe.data)
-                .with_context(|| format!("failed to write TLS probe {}", probe.name))?;
-            stream
-                .flush()
-                .with_context(|| format!("failed to flush TLS probe {}", probe.name))?;
-            read_available(&mut stream)
-        }
-    }
+    let stream = write_plain_probe(target, timeout, plain_stream, &probe.data)
+        .with_context(|| format!("failed to write probe {}", probe.name))?;
+    read_available(stream)
 }
 
 fn connect_stream(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
@@ -798,6 +717,7 @@ fn should_reconnect_plain_stream(error: &anyhow::Error) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn connect_tls_stream(
     host: &str,
     port: u16,
@@ -816,6 +736,7 @@ fn connect_tls_stream(
     Ok(stream)
 }
 
+#[cfg(test)]
 fn tls_client_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| {
@@ -832,6 +753,7 @@ fn tls_client_config() -> Arc<ClientConfig> {
     }))
 }
 
+#[cfg(test)]
 fn tls_server_name(host: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(host.to_string()).context("invalid TLS server name")
 }
@@ -1070,13 +992,6 @@ fn identify_manual_response(
     None
 }
 
-fn is_generic_tls_result(
-    result: &ServiceFingerprint,
-    transport: FingerprintTransport,
-) -> bool {
-    matches!(transport, FingerprintTransport::Tls) && result.service == "ssl"
-}
-
 fn unknown_result(target: &ServiceFingerprintTarget, banner: String) -> ServiceFingerprint {
     ServiceFingerprint {
         host: target.host.clone(),
@@ -1162,10 +1077,6 @@ fn trim_smb_banner(response: &[u8]) -> Option<String> {
 }
 
 impl ProbeDatabase {
-    fn prefers_tls(&self, port: u16) -> bool {
-        self.tls_ports.contains(&port)
-    }
-
     fn candidate_probes(&self, port: u16) -> Vec<usize> {
         let mut seen = HashSet::new();
         let mut probes = Vec::new();
@@ -1195,6 +1106,7 @@ mod tests {
     use rustls::{ServerConfig, ServerConnection, StreamOwned};
     use std::io::{BufReader, ErrorKind};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -1362,20 +1274,72 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             }
         });
 
-        let banner = read_initial_banner(
-            &ServiceFingerprintTarget {
-                host: "127.0.0.1".to_string(),
-                port,
-            },
-            Duration::from_secs(1),
-            FingerprintTransport::Tls,
-            &mut None,
-        )
-        .expect("TLS banner should be readable");
+        let mut stream = connect_tls_stream("127.0.0.1", port, Duration::from_secs(1))
+            .expect("TLS stream should connect");
+        let banner = read_available(&mut stream).expect("TLS banner should be readable");
 
         server.join().expect("server should finish");
 
         assert!(String::from_utf8_lossy(&banner).contains("ESMTP"));
+    }
+
+    #[test]
+    fn does_not_retry_ssl_ports_with_real_tls_handshake_like_go() {
+        let _ = probe_database().expect("probe database should parse");
+        let listener = [8443_u16, 9443, 10443]
+            .into_iter()
+            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("listener should bind on known SSL port");
+        let port = listener.local_addr().expect("addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be nonblocking");
+        let config = tls_test_config();
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let server_handshakes = Arc::clone(&handshakes);
+
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("read timeout should set");
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .expect("write timeout should set");
+                        let conn =
+                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let mut tls = StreamOwned::new(conn, stream);
+                        if tls.conn.complete_io(&mut tls.sock).is_err() {
+                            continue;
+                        }
+                        server_handshakes.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+        });
+
+        let matches = fingerprint_services(
+            &[ServiceFingerprintTarget {
+                host: "127.0.0.1".to_string(),
+                port,
+            }],
+            Duration::from_secs(1),
+            1,
+        )
+        .expect("fingerprint should succeed");
+
+        server.join().expect("server should finish");
+
+        assert_eq!(matches.len(), 1);
+        assert!(!matches[0].service.is_empty());
+        assert_eq!(handshakes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1948,7 +1912,6 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             probes: (0..64)
                 .map(|index| Probe {
                     name: format!("Probe{index}"),
-                    protocol: "TCP".to_string(),
                     data: Vec::new(),
                     ports: Vec::new(),
                     ssl_ports: Vec::new(),
@@ -1961,7 +1924,6 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             probes_by_name: HashMap::new(),
             default_tcp_probes: (0..64).collect(),
             go_port_map: HashMap::new(),
-            tls_ports: HashSet::new(),
         };
 
         let candidates = database.candidate_probes(65000);
