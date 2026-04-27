@@ -14,7 +14,6 @@ use std::thread;
 use std::time::Duration;
 
 const MAX_FAILURES: usize = 10;
-const MAX_ACTIVE_PROBES: usize = 48;
 const PROBES_SOURCE: &str = include_str!("../assets/nmap-service-probes.txt");
 const GO_CONFIG_SOURCE: &str = include_str!("../assets/Config.go");
 const GO_FINGERPRINT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(6);
@@ -1175,9 +1174,6 @@ impl ProbeDatabase {
         }
 
         for probe in &self.default_tcp_probes {
-            if probes.len() >= MAX_ACTIVE_PROBES {
-                break;
-            }
             if seen.insert(*probe) {
                 probes.push(*probe);
             }
@@ -1865,5 +1861,34 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                 .collect::<Vec<_>>()
         );
         assert!(!names.iter().any(|name| name == "mqtt"));
+    }
+
+    #[test]
+    fn does_not_cap_default_probe_count_like_go() {
+        let database = ProbeDatabase {
+            probes: (0..64)
+                .map(|index| Probe {
+                    name: format!("Probe{index}"),
+                    protocol: "TCP".to_string(),
+                    data: Vec::new(),
+                    ports: Vec::new(),
+                    ssl_ports: Vec::new(),
+                    total_wait_ms: None,
+                    rarity: 1,
+                    fallback: None,
+                    matches: Vec::new(),
+                })
+                .collect(),
+            probes_by_name: HashMap::new(),
+            default_tcp_probes: (0..64).collect(),
+            go_port_map: HashMap::new(),
+            tls_ports: HashSet::new(),
+        };
+
+        let candidates = database.candidate_probes(65000);
+
+        assert_eq!(candidates.len(), 64);
+        assert_eq!(candidates[0], 0);
+        assert_eq!(candidates[63], 63);
     }
 }
