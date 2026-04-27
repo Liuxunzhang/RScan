@@ -1,0 +1,19 @@
+[package]
+name = "rscan-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rscan-config = { path = "../config" }
+ rscan-fingerprint = { path = "../fingerprint" }
+rscan-net = { path = "../net" }
+rscan-output = { path = "../output" }
+rscan-poc = { path = "../poc" }
+rscan-platform = { path = "../platform" }
+rscan-plugins = { path = "../plugins" }
+rscan-web = { path = "../web" }
+serde_json.workspace = true
+time.workspace = true
