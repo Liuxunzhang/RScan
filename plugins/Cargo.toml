@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 aes = "0.8.4"
+amiquip = { version = "0.4.2", default-features = false }
 anyhow.workspace = true
 base64 = "0.22.1"
 cbc = "0.1.2"

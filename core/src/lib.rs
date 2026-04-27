@@ -1,19 +1,19 @@
 use anyhow::Result;
-use rscan_config::AppConfig;
+use rscan_config::{AppConfig, parse_scan_mode_list};
 use rscan_fingerprint::{ServiceFingerprint, ServiceFingerprintTarget, fingerprint_services};
 use rscan_net::{expand_targets, parse_ports, probe_live_hosts, scan_tcp_ports};
 use rscan_output::{ResultType, ScanResult};
 use rscan_platform::{collect_dc_info, collect_local_system_info, collect_minidump};
 use rscan_plugins::{
     AuthRuntimeOptions, ConnectionRuntimeOptions, Ms17010RuntimeOptions, OpenService,
-    PluginContext, RedisRuntimeOptions, ServiceScanRuntimeOptions, Transport, scan_services,
+    PluginContext, RedisRuntimeOptions, ServiceScanRuntimeOptions, scan_services,
     select_plugins, set_auth_runtime_options, set_connection_runtime_options,
     set_ms17010_runtime_options, set_redis_runtime_options, set_service_scan_runtime_options,
 };
 use rscan_poc::{
     PocExecutionOptions, execute_pocs, filter_pocs, load_embedded_pocs, load_pocs_from_path,
 };
-use rscan_web::{WebScanResult, scan_target};
+use rscan_web::{WebScanResult, poc_aliases_for_fingerprints, scan_target};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
@@ -30,7 +30,12 @@ impl Application {
         Self { config }
     }
 
+    pub fn validate_mode_selection(&self) -> Result<()> {
+        validate_mode_selection(&self.config.scan.mode.to_string())
+    }
+
     pub fn render_scan_plan(&self) -> Result<String> {
+        self.validate_mode_selection()?;
         let mode = self.config.scan.mode.to_string();
         let local_modules = selected_local_modules(&mode, self.config.scan.local_mode);
         let resolved = self.config.resolve_inputs()?;
@@ -74,10 +79,12 @@ impl Application {
     }
 
     pub fn run(&self) -> Result<ExecutionReport> {
+        self.validate_mode_selection()?;
         let mode = self.config.scan.mode.to_string();
+        let web_modules = selected_web_modules(&mode);
         let local_modules = selected_local_modules(&mode, self.config.scan.local_mode);
-        let local_only_mode = !local_modules.is_empty() && is_local_only_mode(&mode);
         let resolved = self.config.resolve_inputs()?;
+        let local_only_mode = should_run_local_only(&self.config, &resolved, &local_modules);
         let expanded_hosts = expand_targets(&resolved.hosts)?;
         let direct_open_ports = expand_direct_host_ports(&resolved.host_ports)?;
         let excluded_hosts = expand_targets(&resolved.exclude_hosts)?;
@@ -160,9 +167,6 @@ impl Application {
         let service_plugin_defs = select_plugins(&mode);
         let service_targets = build_service_targets(
             &mode,
-            &service_plugin_defs,
-            &scan_hosts,
-            &scan_ports,
             &open_ports,
         );
         let service_findings = if service_plugin_defs.is_empty() || service_targets.is_empty() {
@@ -171,6 +175,8 @@ impl Application {
             set_auth_runtime_options(AuthRuntimeOptions {
                 domain: self.config.auth.domain.clone(),
                 hashes: resolved.hashes.clone(),
+                extra_usernames: resolved.extra_usernames.clone(),
+                extra_passwords: resolved.extra_passwords.clone(),
                 disable_brute: self.config.scan.disable_brute,
             });
             set_redis_runtime_options(RedisRuntimeOptions {
@@ -204,10 +210,13 @@ impl Application {
             )?
         };
         let service_finding_count = service_findings.len();
-        let web_targets = if local_only_mode {
+        let should_run_web = should_run_web_scan(&mode, &resolved.urls, &web_modules);
+        let include_all_open_ports_for_web =
+            should_include_all_open_ports_for_web(&mode, &web_modules);
+        let web_targets = if local_only_mode || !should_run_web {
             Vec::new()
         } else {
-            build_web_targets(&resolved.urls, &open_ports)?
+            build_web_targets(&resolved.urls, &open_ports, include_all_open_ports_for_web)?
         };
         let web_results = web_targets
             .iter()
@@ -221,19 +230,19 @@ impl Application {
             status: finding.status,
             details: finding.details,
         }));
-        let selected_plugin_count =
-            service_plugin_defs.len() + local_modules.len() + selected_web_modules(&mode).len();
+        let selected_plugin_count = service_plugin_defs.len() + local_modules.len() + web_modules.len();
         let local_results = build_local_results(&local_modules)?;
         let local_result_count = local_results.len();
         results.extend(local_results);
         results.extend(web_results.iter().map(build_web_scan_result));
         let selected_pocs = self.selected_pocs()?;
-        let poc_target_count = if selected_pocs.is_empty() {
+        let available_pocs = self.available_pocs()?;
+        let poc_target_count = if available_pocs.is_empty() {
             0
         } else {
             web_results.len()
         };
-        let poc_matches = if selected_pocs.is_empty() || web_results.is_empty() {
+        let poc_matches = if available_pocs.is_empty() || web_results.is_empty() {
             Vec::new()
         } else {
             let options = PocExecutionOptions {
@@ -243,9 +252,21 @@ impl Application {
                 socks5_proxy: self.config.web.socks5_proxy.clone(),
                 workers: usize::from(self.config.poc.workers),
             };
+            let explicit_poc_name = self.config.poc.poc_name.as_deref();
             web_results
                 .iter()
-                .map(|target| execute_pocs(&target.final_url, &selected_pocs, &options))
+                .map(|target| {
+                    let target_pocs = select_pocs_for_web_result(
+                        &available_pocs,
+                        target,
+                        explicit_poc_name,
+                    );
+                    if target_pocs.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        execute_pocs(&normalize_poc_target(&target.final_url), &target_pocs, &options)
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .flatten()
@@ -321,18 +342,7 @@ impl Application {
     }
 
     fn selected_pocs(&self) -> Result<Vec<rscan_poc::Poc>> {
-        if self.config.poc.disable_poc_scan {
-            return Ok(Vec::new());
-        }
-        if !self.config.poc.full && self.config.poc.poc_name.is_none() {
-            return Ok(Vec::new());
-        }
-
-        let all = if let Some(path) = &self.config.poc.poc_path {
-            load_pocs_from_path(path)?
-        } else {
-            load_embedded_pocs()?
-        };
+        let all = self.available_pocs()?;
         let selected = if let Some(name) = &self.config.poc.poc_name {
             filter_pocs(&all, name).into_iter().cloned().collect()
         } else {
@@ -340,6 +350,60 @@ impl Application {
         };
         Ok(selected)
     }
+
+    fn available_pocs(&self) -> Result<Vec<rscan_poc::Poc>> {
+        if self.config.poc.disable_poc_scan {
+            return Ok(Vec::new());
+        }
+        let mode = self.config.scan.mode.to_string();
+        let web_modules = selected_web_modules(&mode);
+        let implicit_web_pocs = mode == "all"
+            || web_modules.iter().any(|module| module == "webpoc");
+        if !self.config.poc.full && self.config.poc.poc_name.is_none() && !implicit_web_pocs {
+            return Ok(Vec::new());
+        }
+
+        if let Some(path) = &self.config.poc.poc_path {
+            load_pocs_from_path(path)
+        } else {
+            load_embedded_pocs()
+        }
+    }
+}
+
+fn select_pocs_for_web_result(
+    available_pocs: &[rscan_poc::Poc],
+    target: &WebScanResult,
+    explicit_poc_name: Option<&str>,
+) -> Vec<rscan_poc::Poc> {
+    if !target.fingerprints.is_empty() {
+        let aliases = poc_aliases_for_fingerprints(&target.fingerprints);
+        if aliases.is_empty() {
+            return Vec::new();
+        }
+
+        let aliases = aliases
+            .into_iter()
+            .map(|alias| alias.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        return available_pocs
+            .iter()
+            .filter(|poc| {
+                let poc_name = poc.name.to_ascii_lowercase();
+                aliases.iter().any(|alias| poc_name.contains(alias))
+            })
+            .cloned()
+            .collect();
+    }
+
+    if let Some(name) = explicit_poc_name {
+        return filter_pocs(available_pocs, name)
+            .into_iter()
+            .cloned()
+            .collect();
+    }
+
+    available_pocs.to_vec()
 }
 
 fn build_local_results(modules: &[String]) -> Result<Vec<ScanResult>> {
@@ -364,11 +428,54 @@ fn build_local_results(modules: &[String]) -> Result<Vec<ScanResult>> {
 }
 
 fn selected_web_modules(mode: &str) -> Vec<String> {
-    match mode.to_ascii_lowercase().as_str() {
-        "webtitle" => vec!["webtitle".to_string()],
-        "webpoc" => vec!["webpoc".to_string()],
-        _ => Vec::new(),
+    let selected = parse_scan_mode_list(mode);
+    if selected.is_empty() {
+        return Vec::new();
     }
+
+    selected
+        .into_iter()
+        .filter(|item| matches!(item.as_str(), "webtitle" | "webpoc"))
+        .collect()
+}
+
+fn validate_mode_selection(mode: &str) -> Result<()> {
+    if mode == "all" {
+        return Ok(());
+    }
+
+    let selected = parse_scan_mode_list(mode);
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let mut allowed = rscan_plugins::registered_plugins()
+        .into_iter()
+        .map(|plugin| plugin.key.to_string())
+        .collect::<BTreeSet<_>>();
+    allowed.extend(
+        ["webtitle", "webpoc", "localinfo", "dcinfo", "minidump"]
+            .into_iter()
+            .map(str::to_string),
+    );
+
+    let invalid = selected
+        .into_iter()
+        .filter(|item| !allowed.contains(item))
+        .collect::<Vec<_>>();
+    if invalid.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid scan mode: {}", invalid.join(", "))
+    }
+}
+
+fn should_run_web_scan(mode: &str, explicit_urls: &[String], web_modules: &[String]) -> bool {
+    !explicit_urls.is_empty() || mode == "all" || !web_modules.is_empty()
+}
+
+fn should_include_all_open_ports_for_web(mode: &str, web_modules: &[String]) -> bool {
+    mode != "all" && !web_modules.is_empty()
 }
 
 fn build_local_info_result() -> Result<ScanResult> {
@@ -455,22 +562,38 @@ fn build_dcinfo_result() -> Result<Option<ScanResult>> {
     }))
 }
 
-fn is_local_only_mode(mode: &str) -> bool {
-    matches!(
-        mode.to_ascii_lowercase().as_str(),
-        "localinfo" | "dcinfo" | "minidump"
-    )
+fn should_run_local_only(
+    config: &AppConfig,
+    resolved: &rscan_config::ResolvedInputs,
+    local_modules: &[String],
+) -> bool {
+    config.scan.local_mode
+        || (!local_modules.is_empty()
+            && resolved.hosts.is_empty()
+            && resolved.host_ports.is_empty()
+            && resolved.urls.is_empty())
 }
 
 fn selected_local_modules(mode: &str, local_mode: bool) -> Vec<String> {
-    let mode = mode.to_ascii_lowercase();
-    if is_local_only_mode(&mode) {
-        vec![mode]
+    let selected = parse_scan_mode_list(mode)
+        .into_iter()
+        .filter(|item| matches!(item.as_str(), "localinfo" | "dcinfo" | "minidump"))
+        .collect::<Vec<_>>();
+    if !selected.is_empty() {
+        selected
     } else if local_mode {
-        vec!["localinfo".to_string()]
+        all_local_modules()
     } else {
         Vec::new()
     }
+}
+
+fn all_local_modules() -> Vec<String> {
+    vec![
+        "localinfo".to_string(),
+        "dcinfo".to_string(),
+        "minidump".to_string(),
+    ]
 }
 
 fn target_count(config: &AppConfig) -> usize {
@@ -706,6 +829,7 @@ fn exclude_ports(ports: Vec<u16>, excluded_ports: &[u16]) -> Vec<u16> {
 fn build_web_targets(
     explicit_urls: &[String],
     open_ports: &[rscan_net::OpenPort],
+    include_all_open_ports: bool,
 ) -> Result<Vec<String>> {
     let web_ports = parse_ports("web")?.into_iter().collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
@@ -718,7 +842,7 @@ fn build_web_targets(
     }
 
     for open in open_ports {
-        if web_ports.contains(&open.port) {
+        if include_all_open_ports || web_ports.contains(&open.port) {
             let target = format!("{}:{}", open.host, open.port);
             if seen.insert(target.clone()) {
                 targets.push(target);
@@ -731,9 +855,6 @@ fn build_web_targets(
 
 fn build_service_targets(
     mode: &str,
-    plugin_defs: &[rscan_plugins::PluginDefinition],
-    scan_hosts: &[String],
-    scan_ports: &[u16],
     open_ports: &[rscan_net::OpenPort],
 ) -> Vec<OpenService> {
     let mut seen = BTreeSet::new();
@@ -749,27 +870,8 @@ fn build_service_targets(
         }
     }
 
-    if mode.eq_ignore_ascii_case("all") {
+    if mode == "all" {
         return targets;
-    }
-
-    let has_udp_plugin = plugin_defs
-        .iter()
-        .any(|plugin| matches!(plugin.transport, Transport::Udp));
-    if !has_udp_plugin {
-        return targets;
-    }
-
-    for host in scan_hosts {
-        for port in scan_ports {
-            let key = (host.clone(), *port);
-            if seen.insert(key.clone()) {
-                targets.push(OpenService {
-                    host: key.0,
-                    port: key.1,
-                });
-            }
-        }
     }
 
     targets
@@ -842,10 +944,47 @@ fn build_web_scan_result(web: &WebScanResult) -> ScanResult {
     ScanResult {
         time: now_timestamp(),
         kind: ResultType::Service,
-        target: web.final_url.clone(),
+        target: web_result_target(web),
         status: "identified".to_string(),
         details,
     }
+}
+
+fn web_result_target(web: &WebScanResult) -> String {
+    web_authority_host(&web.requested_url)
+        .or_else(|| web_authority_host(&web.final_url))
+        .unwrap_or_else(|| web.original_target.clone())
+}
+
+fn web_authority_host(url: &str) -> Option<String> {
+    let (_, remainder) = url.split_once("://")?;
+    let authority = remainder.split('/').next()?.rsplit('@').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.starts_with('[') {
+        return authority
+            .find(']')
+            .map(|end| authority[..=end].to_string());
+    }
+    Some(
+        authority
+            .split_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(authority)
+            .to_string(),
+    )
+}
+
+fn normalize_poc_target(url: &str) -> String {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority = remainder
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(remainder);
+    format!("{scheme}://{authority}")
 }
 
 fn web_result_port(url: &str) -> Option<String> {
@@ -937,7 +1076,7 @@ mod tests {
         });
 
         let report = Application::new(
-            AppConfig::from_tokens(["-u", &format!("http://127.0.0.1:{port}")])
+            AppConfig::from_tokens(["-u", &format!("http://127.0.0.1:{port}"), "-nopoc"])
                 .expect("config should parse"),
         )
         .run()
@@ -954,6 +1093,56 @@ mod tests {
         assert_eq!(report.results[0].kind, ResultType::Service);
         assert_eq!(report.results[0].status, "identified");
         assert_eq!(report.results[0].details["title"], json!("RabbitMQ UI"));
+    }
+
+    #[test]
+    fn falls_back_from_explicit_https_url_targets_like_go() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("request should arrive");
+                let mut buffer = [0u8; 1024];
+                let size = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                if !request.starts_with("GET ") {
+                    continue;
+                }
+                let body = "<html><title>HTTPS URL Fallback</title></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should write");
+                break;
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens(["-u", &format!("https://127.0.0.1:{port}"), "-nopoc"])
+                .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server thread should exit");
+
+        assert_eq!(report.summary.web_target_count, 1);
+        assert_eq!(report.summary.web_result_count, 1);
+        assert_eq!(report.results[0].status, "identified");
+        assert_eq!(report.results[0].details["title"], json!("HTTPS URL Fallback"));
+        assert_eq!(
+            report.results[0].details["Url"],
+            json!(format!("http://127.0.0.1:{port}/"))
+        );
     }
 
     #[test]
@@ -995,7 +1184,7 @@ mod tests {
         });
 
         let report = Application::new(
-            AppConfig::from_tokens(["-h", "127.0.0.1", "-p", &port.to_string()])
+            AppConfig::from_tokens(["-h", "127.0.0.1", "-p", &port.to_string(), "-nopoc"])
                 .expect("config should parse"),
         )
         .run()
@@ -1009,6 +1198,75 @@ mod tests {
         assert!(report.results.iter().any(|result| {
             result.kind == ResultType::Service && result.details["title"] == json!("Auto Web")
         }));
+    }
+
+    #[test]
+    fn skips_web_scan_for_non_web_custom_plugin_modes_like_go() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = [18080_u16, 18082, 19001, 20000]
+            .into_iter()
+            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("listener should bind on a known web port");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be nonblocking");
+
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("timeout should set");
+                        let mut buffer = [0u8; 1024];
+                        let size = stream.read(&mut buffer).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buffer[..size]);
+                        if request.starts_with("stats") {
+                            stream
+                                .write_all(b"ERROR\r\n")
+                                .expect("response should write");
+                        } else {
+                            let body = "<html><title>Should Not Scan Web</title></html>";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            stream
+                                .write_all(response.as_bytes())
+                                .expect("response should write");
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept should succeed: {error}"),
+                }
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens(["-h", "127.0.0.1", "-p", &port.to_string(), "-m", "memcached"])
+                .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server thread should exit");
+
+        assert_eq!(report.summary.selected_plugin_count, 1);
+        assert_eq!(report.summary.web_target_count, 0);
+        assert_eq!(report.summary.web_result_count, 0);
+        assert!(!report
+            .results
+            .iter()
+            .any(|result| result.kind == ResultType::Service && result.details.contains_key("title")));
     }
 
     #[test]
@@ -1071,6 +1329,76 @@ mod tests {
             result.kind == ResultType::Vuln
                 && result.status == "vulnerable"
                 && result.details["poc"] == json!("poc-yaml-kibana-unauth")
+        }));
+    }
+
+    #[test]
+    fn executes_named_poc_from_url_origin_like_go() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::{env, fs};
+
+        let root = env::temp_dir().join(format!(
+            "rscan-core-poc-origin-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("temp poc dir should exist");
+        fs::write(
+            root.join("origin.yaml"),
+            "name: poc-yaml-origin-only\nrules:\n  - method: GET\n    path: kibana\n    expression: response.body.bcontains(b\"origin-only-poc\")\n",
+        )
+        .expect("custom poc should write");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("request should arrive");
+                let mut buffer = [0u8; 2048];
+                let size = stream.read(&mut buffer).expect("request should read");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let body = if request.starts_with("GET /app/login?x=1 ") {
+                    "<html><title>Login</title></html>"
+                } else if request.starts_with("GET /kibana ") {
+                    "<html><body>origin-only-poc</body></html>"
+                } else {
+                    "<html><body>wrong-base</body></html>"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should write");
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens([
+                "-u",
+                &format!("http://127.0.0.1:{port}/app/login?x=1"),
+                "-pocpath",
+                root.to_string_lossy().as_ref(),
+                "-pocname",
+                "origin-only",
+            ])
+            .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server thread should exit");
+
+        assert_eq!(report.summary.selected_poc_count, 1);
+        assert_eq!(report.summary.poc_match_count, 1);
+        assert!(report.results.iter().any(|result| {
+            result.kind == ResultType::Vuln
+                && result.status == "vulnerable"
+                && result.details["poc"] == json!("poc-yaml-origin-only")
         }));
     }
 
@@ -1365,6 +1693,7 @@ mod tests {
 
         assert_eq!(result.kind, ResultType::Service);
         assert_eq!(result.status, "identified");
+        assert_eq!(result.target, "127.0.0.1");
         assert_eq!(result.details["service"], json!("http"));
         assert_eq!(result.details["Url"], json!("http://127.0.0.1:18080/"));
         assert_eq!(result.details["port"], json!("18080"));
@@ -1392,6 +1721,7 @@ mod tests {
             result.details["server_info"]["redirect_Url"],
             json!("https://127.0.0.1:8443/login")
         );
+        assert_eq!(result.target, "127.0.0.1");
     }
 
     #[test]
@@ -1454,6 +1784,75 @@ mod tests {
     }
 
     #[test]
+    fn named_webtitle_scans_non_web_ports_like_go() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind(("127.0.0.1", 12345))
+            .or_else(|_| TcpListener::bind(("127.0.0.1", 12346)))
+            .expect("listener should bind on a non-web port");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be nonblocking");
+
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut accepts = 0usize;
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepts += 1;
+                        let mut buffer = [0u8; 1024];
+                        let size = stream.read(&mut buffer).unwrap_or(0);
+                        if accepts == 1 {
+                            continue;
+                        }
+                        let request = String::from_utf8_lossy(&buffer[..size]);
+                        if !request.starts_with("GET ") {
+                            continue;
+                        }
+                        let body = "<html><title>Named Non-Web WebTitle</title></html>";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("response should write");
+                        break;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept should succeed: {error}"),
+                }
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens(["-h", "127.0.0.1", "-p", &port.to_string(), "-m", "webtitle"])
+                .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server thread should exit");
+
+        assert_eq!(report.summary.selected_plugin_count, 1);
+        assert_eq!(report.summary.web_target_count, 1);
+        assert_eq!(report.summary.web_result_count, 1);
+        assert!(report.results.iter().any(|result| {
+            result.kind == ResultType::Service
+                && result.status == "identified"
+                && result.details["title"] == json!("Named Non-Web WebTitle")
+        }));
+    }
+
+    #[test]
     fn counts_named_webpoc_mode_as_selected_plugin() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -1511,10 +1910,22 @@ mod tests {
     }
 
     #[test]
-    fn executes_memcached_service_plugin() {
+    fn named_webpoc_loads_default_pocs_like_go() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
+        use std::{env, fs};
+
+        let root = env::temp_dir().join(format!(
+            "rscan-core-webpoc-default-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("temp poc dir should exist");
+        fs::write(
+            root.join("custom.yaml"),
+            "name: poc-yaml-webpoc-default\nrules:\n  - method: GET\n    path: /\n    expression: response.body.bcontains(b\"named-webpoc-default\")\n",
+        )
+        .expect("custom poc should write");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let port = listener.local_addr().expect("local addr").port();
@@ -1523,16 +1934,251 @@ mod tests {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().expect("request should arrive");
                 let mut buffer = [0u8; 2048];
-                let size = stream.read(&mut buffer).expect("request should read");
-                let request = String::from_utf8_lossy(&buffer[..size]);
-                if request.starts_with("stats") {
-                    stream
-                        .write_all(b"STAT pid 1\r\nEND\r\n")
-                        .expect("response should write");
+                let _ = stream.read(&mut buffer).expect("request should read");
+                let body = "<html><title>Named WebPoc Default</title>named-webpoc-default</html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should write");
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens([
+                "-m",
+                "webpoc",
+                "-u",
+                &format!("http://127.0.0.1:{port}"),
+                "-pocpath",
+                root.to_string_lossy().as_ref(),
+            ])
+            .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server thread should exit");
+
+        assert_eq!(report.summary.selected_plugin_count, 1);
+        assert_eq!(report.summary.selected_poc_count, 1);
+        assert_eq!(report.summary.poc_match_count, 1);
+        assert!(report.results.iter().any(|result| {
+            result.kind == ResultType::Vuln
+                && result.status == "vulnerable"
+                && result.details["poc"] == json!("poc-yaml-webpoc-default")
+        }));
+    }
+
+    #[test]
+    fn runs_only_fingerprint_matched_pocs_like_go() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::{env, fs};
+
+        let root = env::temp_dir().join(format!(
+            "rscan-core-webpoc-fingerprint-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("temp poc dir should exist");
+        fs::write(
+            root.join("weblogic.yaml"),
+            "name: poc-yaml-weblogic-match\nrules:\n  - method: GET\n    path: /\n    expression: response.body.bcontains(b\"fingerprint-routed-poc\")\n",
+        )
+        .expect("weblogic poc should write");
+        fs::write(
+            root.join("rabbitmq.yaml"),
+            "name: poc-yaml-rabbitmq-match\nrules:\n  - method: GET\n    path: /\n    expression: response.body.bcontains(b\"fingerprint-routed-poc\")\n",
+        )
+        .expect("rabbitmq poc should write");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("request should arrive");
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer).expect("request should read");
+                let body = "<html><title>Oracle WebLogic Server 管理控制台</title>fingerprint-routed-poc</html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should write");
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens([
+                "-m",
+                "webpoc",
+                "-u",
+                &format!("http://127.0.0.1:{port}"),
+                "-pocpath",
+                root.to_string_lossy().as_ref(),
+            ])
+            .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server thread should exit");
+
+        assert_eq!(report.summary.selected_poc_count, 2);
+        assert_eq!(report.summary.poc_match_count, 1);
+        assert!(report.results.iter().any(|result| {
+            result.kind == ResultType::Vuln
+                && result.status == "vulnerable"
+                && result.details["poc"] == json!("poc-yaml-weblogic-match")
+        }));
+        assert!(!report.results.iter().any(|result| {
+            result.kind == ResultType::Vuln
+                && result.status == "vulnerable"
+                && result.details["poc"] == json!("poc-yaml-rabbitmq-match")
+        }));
+    }
+
+    #[test]
+    fn prioritizes_fingerprint_pocs_over_explicit_poc_name_like_go() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::{env, fs};
+
+        let root = env::temp_dir().join(format!(
+            "rscan-core-webpoc-precedence-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("temp poc dir should exist");
+        fs::write(
+            root.join("weblogic.yaml"),
+            "name: poc-yaml-weblogic-match\nrules:\n  - method: GET\n    path: /weblogic\n    expression: response.body.bcontains(b\"fingerprint-priority-poc\")\n",
+        )
+        .expect("weblogic poc should write");
+        fs::write(
+            root.join("rabbitmq.yaml"),
+            "name: poc-yaml-rabbitmq-match\nrules:\n  - method: GET\n    path: /rabbitmq\n    expression: response.body.bcontains(b\"fingerprint-priority-poc\")\n",
+        )
+        .expect("rabbitmq poc should write");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen_requests = Arc::clone(&requests);
+
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("request should arrive");
+                let mut buffer = [0u8; 2048];
+                let bytes = stream.read(&mut buffer).expect("request should read");
+                let request = String::from_utf8_lossy(&buffer[..bytes]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_requests
+                    .lock()
+                    .expect("requests should lock")
+                    .push(path.clone());
+                let body = if path == "/" {
+                    "<html><title>Oracle WebLogic Server 管理控制台</title>fingerprint-priority-poc</html>"
                 } else {
-                    stream
-                        .write_all(b"VERSION 1.6.9\r\n")
-                        .expect("response should write");
+                    "fingerprint-priority-poc"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response should write");
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens([
+                "-m",
+                "webpoc",
+                "-u",
+                &format!("http://127.0.0.1:{port}"),
+                "-pocpath",
+                root.to_string_lossy().as_ref(),
+                "-pocname",
+                "rabbitmq-match",
+            ])
+            .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server thread should exit");
+        let requests = requests.lock().expect("requests should lock").clone();
+
+        assert_eq!(report.summary.selected_poc_count, 1);
+        assert_eq!(report.summary.poc_match_count, 1);
+        assert_eq!(requests, vec!["/".to_string(), "/weblogic".to_string()]);
+        assert!(report.results.iter().any(|result| {
+            result.kind == ResultType::Vuln
+                && result.status == "vulnerable"
+                && result.details["poc"] == json!("poc-yaml-weblogic-match")
+        }));
+        assert!(!report.results.iter().any(|result| {
+            result.kind == ResultType::Vuln
+                && result.status == "vulnerable"
+                && result.details["poc"] == json!("poc-yaml-rabbitmq-match")
+        }));
+    }
+
+    #[test]
+    fn executes_memcached_service_plugin() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be nonblocking");
+
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0u8; 2048];
+                        let size = stream.read(&mut buffer).expect("request should read");
+                        if size == 0 {
+                            continue;
+                        }
+                        let request = String::from_utf8_lossy(&buffer[..size]);
+                        if request.starts_with("stats") {
+                            stream
+                                .write_all(b"STAT pid 1\r\nEND\r\n")
+                                .expect("response should write");
+                        } else {
+                            stream
+                                .write_all(b"VERSION 1.6.9\r\n")
+                                .expect("response should write");
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept should succeed: {error}"),
                 }
             }
         });
@@ -1564,7 +2210,177 @@ mod tests {
     }
 
     #[test]
-    fn executes_snmp_service_plugin_without_tcp_open_port() {
+    fn executes_comma_separated_service_plugins_like_go() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be nonblocking");
+
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0u8; 2048];
+                        let size = stream.read(&mut buffer).expect("request should read");
+                        if size == 0 {
+                            continue;
+                        }
+                        let request = String::from_utf8_lossy(&buffer[..size]);
+                        if request.starts_with("stats") {
+                            stream
+                                .write_all(b"STAT pid 1\r\nEND\r\n")
+                                .expect("response should write");
+                        } else if request.starts_with("info") || request.starts_with("INFO") {
+                            stream.write_all(b"ERROR\r\n").expect("response should write");
+                        } else {
+                            stream
+                                .write_all(b"VERSION 1.6.9\r\n")
+                                .expect("response should write");
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept should succeed: {error}"),
+                }
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens([
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "redis,memcached",
+            ])
+            .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server should finish");
+
+        assert_eq!(report.summary.selected_plugin_count, 2);
+        assert_eq!(report.summary.service_finding_count, 1);
+        assert!(report.results.iter().any(|result| {
+            result.kind == ResultType::Vuln
+                && result.status == "unauthorized-access"
+                && result.details["service"] == json!("memcached")
+        }));
+    }
+
+    #[test]
+    fn skips_snmp_service_plugin_without_explicit_hostport_like_go() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket should bind");
+        let port = socket.local_addr().expect("local addr").port();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("socket timeout should set");
+
+        let report = Application::new(
+            AppConfig::from_tokens(["-h", "127.0.0.1", "-p", &port.to_string(), "-m", "snmp"])
+                .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        assert_eq!(report.summary.open_port_count, 0);
+        assert_eq!(report.summary.selected_plugin_count, 1);
+        assert_eq!(report.summary.service_finding_count, 0);
+        let mut buffer = [0u8; 2048];
+        let err = socket
+            .recv_from(&mut buffer)
+            .expect_err("snmp request should not be sent");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected recv error: {err}"
+        );
+    }
+
+    #[test]
+    fn mixed_remote_and_local_modes_keep_remote_scan_like_go() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::thread;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should be nonblocking");
+
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0u8; 2048];
+                        let size = stream.read(&mut buffer).expect("request should read");
+                        if size == 0 {
+                            continue;
+                        }
+                        let request = String::from_utf8_lossy(&buffer[..size]);
+                        if request.starts_with("stats") {
+                            stream
+                                .write_all(b"STAT pid 1\r\nEND\r\n")
+                                .expect("response should write");
+                        } else {
+                            stream
+                                .write_all(b"VERSION 1.6.9\r\n")
+                                .expect("response should write");
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("accept should succeed: {error}"),
+                }
+            }
+        });
+
+        let report = Application::new(
+            AppConfig::from_tokens([
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-m",
+                "memcached,localinfo",
+            ])
+            .expect("config should parse"),
+        )
+        .run()
+        .expect("scan should run");
+
+        server.join().expect("server should finish");
+
+        assert_eq!(report.summary.selected_plugin_count, 2);
+        assert_eq!(report.summary.service_finding_count, 1);
+        assert_eq!(report.summary.local_result_count, 1);
+        assert!(report.results.iter().any(|result| {
+            result.kind == ResultType::Vuln
+                && result.status == "unauthorized-access"
+                && result.details["service"] == json!("memcached")
+        }));
+        assert!(report.results.iter().any(|result| {
+            result.kind == ResultType::Service && result.status == "local-info"
+        }));
+    }
+
+    #[test]
+    fn executes_snmp_service_plugin_for_explicit_hostport_like_go() {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("socket should bind");
         let port = socket.local_addr().expect("local addr").port();
 
@@ -1580,7 +2396,7 @@ mod tests {
         });
 
         let report = Application::new(
-            AppConfig::from_tokens(["-h", "127.0.0.1", "-p", &port.to_string(), "-m", "snmp"])
+            AppConfig::from_tokens(["-h", &format!("127.0.0.1:{port}"), "-m", "snmp"])
                 .expect("config should parse"),
         )
         .run()
@@ -1588,7 +2404,7 @@ mod tests {
 
         server.join().expect("server should finish");
 
-        assert_eq!(report.summary.open_port_count, 0);
+        assert_eq!(report.summary.open_port_count, 1);
         assert_eq!(report.summary.selected_plugin_count, 1);
         assert_eq!(report.summary.service_finding_count, 1);
         assert!(report.results.iter().any(|result| {
@@ -1606,12 +2422,24 @@ mod tests {
                 .expect("scan should run");
 
         assert_eq!(report.summary.local_result_count, 1);
-        assert_eq!(report.summary.selected_plugin_count, 32);
+        assert_eq!(report.summary.selected_plugin_count, 34);
         assert!(report.results.iter().any(|result| {
             result.kind == ResultType::Service
                 && result.status == "local-info"
                 && result.details.contains_key("hostname")
         }));
+    }
+
+    #[test]
+    fn local_mode_selects_all_local_modules_like_go() {
+        assert_eq!(
+            selected_local_modules("all", true),
+            vec![
+                "localinfo".to_string(),
+                "dcinfo".to_string(),
+                "minidump".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1658,6 +2486,34 @@ mod tests {
         assert_eq!(report.summary.selected_plugin_count, 1);
         assert_eq!(report.summary.service_finding_count, 0);
         assert_eq!(report.summary.local_result_count, 0);
+    }
+
+    #[test]
+    fn rejects_invalid_scan_mode_entries_like_go() {
+        let app = Application::new(
+            AppConfig::from_tokens(["-h", "127.0.0.1", "-m", "ssh,invalid"])
+                .expect("config should parse"),
+        );
+
+        let error = app
+            .render_scan_plan()
+            .expect_err("invalid scan mode should fail before rendering");
+
+        assert!(error.to_string().contains("invalid scan mode: invalid"));
+    }
+
+    #[test]
+    fn rejects_mixed_case_scan_mode_entries_like_go() {
+        let app = Application::new(
+            AppConfig::from_tokens(["-h", "127.0.0.1", "-m", "WebTitle"])
+                .expect("config should parse"),
+        );
+
+        let error = app
+            .render_scan_plan()
+            .expect_err("mixed-case scan mode should fail like go");
+
+        assert!(error.to_string().contains("invalid scan mode: WebTitle"));
     }
 
     fn ber_tlv(tag: u8, value: &[u8]) -> Vec<u8> {

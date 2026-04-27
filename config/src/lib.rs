@@ -59,7 +59,7 @@ pub enum ScanMode {
 
 impl From<String> for ScanMode {
     fn from(value: String) -> Self {
-        if value.eq_ignore_ascii_case("all") {
+        if value == "all" {
             Self::All
         } else {
             Self::Named(value)
@@ -74,6 +74,17 @@ impl Display for ScanMode {
             Self::Named(value) => f.write_str(value),
         }
     }
+}
+
+pub fn parse_scan_mode_list(mode: &str) -> Vec<String> {
+    let mut parsed = Vec::new();
+    for item in mode.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let item = item.to_string();
+        if !parsed.contains(&item) {
+            parsed.push(item);
+        }
+    }
+    parsed
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,7 +315,9 @@ pub struct ResolvedInputs {
     pub exclude_hosts: Vec<String>,
     pub urls: Vec<String>,
     pub usernames: Vec<String>,
+    pub extra_usernames: Vec<String>,
     pub passwords: Vec<String>,
+    pub extra_passwords: Vec<String>,
     pub hashes: Vec<String>,
     pub ports: String,
     pub exclude_ports: String,
@@ -312,16 +325,15 @@ pub struct ResolvedInputs {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let mut tokens = Vec::new();
-
         if let Ok(fs_args) = env::var("FS_ARGS") {
             let parsed = shlex::split(&fs_args)
                 .ok_or_else(|| ConfigError::InvalidEnvironmentArgs(fs_args.clone()))?;
-            tokens.extend(parsed);
+            if !parsed.is_empty() {
+                return Self::from_tokens(parsed);
+            }
         }
 
-        tokens.extend(env::args().skip(1));
-        Self::from_tokens(tokens)
+        Self::from_tokens(env::args().skip(1))
     }
 
     pub fn from_tokens<I, S>(tokens: I) -> Result<Self, ConfigError>
@@ -556,12 +568,18 @@ impl AppConfig {
         if let Some(path) = &self.auth.users_file {
             append_unique(&mut resolved.usernames, read_nonempty_lines(path)?);
         }
+        if let Some(username) = &self.auth.add_users {
+            append_split_csv(&mut resolved.extra_usernames, username);
+        }
 
         if let Some(password) = &self.auth.password {
             append_split_csv(&mut resolved.passwords, password);
         }
         if let Some(path) = &self.auth.passwords_file {
             append_unique(&mut resolved.passwords, read_nonempty_lines(path)?);
+        }
+        if let Some(password) = &self.auth.add_passwords {
+            append_split_csv(&mut resolved.extra_passwords, password);
         }
 
         if let Some(hash) = &self.auth.hash_value {
@@ -581,21 +599,14 @@ impl AppConfig {
     }
 
     pub fn validate_run_mode(&self) -> Result<(), ConfigError> {
-        let mut modes = 0;
-        if self.targets.host.is_some() || self.targets.hosts_file.is_some() {
-            modes += 1;
-        }
-        if self.targets.url.is_some() || self.targets.urls_file.is_some() {
-            modes += 1;
-        }
-        if self.scan.local_mode || matches_local_mode(&self.scan.mode) {
-            modes += 1;
-        }
+        let has_remote_targets = self.targets.defined_target_count() > 0;
+        let has_local_mode = self.scan.local_mode
+            || (self.targets.defined_target_count() == 0 && matches_local_mode(&self.scan.mode));
 
-        match modes {
-            0 => Err(ConfigError::MissingScanTarget),
-            1 => Ok(()),
-            _ => Err(ConfigError::ConflictingScanModes),
+        match (has_remote_targets, has_local_mode) {
+            (false, false) => Err(ConfigError::MissingScanTarget),
+            (true, true) => Err(ConfigError::ConflictingScanModes),
+            _ => Ok(()),
         }
     }
 
@@ -703,10 +714,9 @@ fn matches_local_mode(mode: &ScanMode) -> bool {
     matches!(
         mode,
         ScanMode::Named(value)
-            if matches!(
-                value.to_ascii_lowercase().as_str(),
-                "localinfo" | "dcinfo" | "minidump"
-            )
+            if parse_scan_mode_list(value)
+                .into_iter()
+                .any(|item| matches!(item.as_str(), "localinfo" | "dcinfo" | "minidump"))
     )
 }
 
@@ -1093,8 +1103,12 @@ mod tests {
             "http://a,http://b",
             "-user",
             "root,admin",
+            "-usera",
+            "guest,oracle",
             "-pwd",
             "pass1,pass2",
+            "-pwda",
+            "pass3,{user}@2024",
             "-hash",
             "0123456789abcdef0123456789abcdef",
         ])
@@ -1106,7 +1120,9 @@ mod tests {
         assert_eq!(resolved.exclude_hosts, Vec::<String>::new());
         assert_eq!(resolved.urls, vec!["http://a", "http://b"]);
         assert_eq!(resolved.usernames, vec!["root", "admin"]);
+        assert_eq!(resolved.extra_usernames, vec!["guest", "oracle"]);
         assert_eq!(resolved.passwords, vec!["pass1", "pass2"]);
+        assert_eq!(resolved.extra_passwords, vec!["pass3", "{user}@2024"]);
         assert_eq!(
             resolved.hashes,
             vec!["0123456789abcdef0123456789abcdef".to_string()]
@@ -1223,10 +1239,9 @@ mod tests {
     fn rejects_conflicting_runtime_modes() {
         let config = AppConfig::from_tokens(["-h", "10.0.0.1", "-u", "http://127.0.0.1"])
             .expect("config should parse");
-        let error = config
+        config
             .validate_run_mode()
-            .expect_err("host and url should conflict");
-        assert!(matches!(error, ConfigError::ConflictingScanModes));
+            .expect("host and url should be allowed like go");
 
         let config = AppConfig::from_tokens(["-h", "10.0.0.1", "-local"])
             .expect("config should parse");
@@ -1234,5 +1249,11 @@ mod tests {
             .validate_run_mode()
             .expect_err("host and local should conflict");
         assert!(matches!(error, ConfigError::ConflictingScanModes));
+
+        let config = AppConfig::from_tokens(["-h", "10.0.0.1", "-m", "redis,localinfo"])
+            .expect("config should parse");
+        config
+            .validate_run_mode()
+            .expect("host mode should allow mixed local plugin list like go");
     }
 }

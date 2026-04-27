@@ -850,6 +850,29 @@ fn prints_scan_plan_when_requested() {
 }
 
 #[test]
+fn prints_all_local_modules_in_local_mode_scan_plan() {
+    let output = temp_output("local-scan-plan");
+    let command = Command::new(env!("CARGO_BIN_EXE_rscan"))
+        .args([
+            "-local",
+            "-sp",
+            "-f",
+            "json",
+            "-o",
+            output.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("command should run");
+    assert!(command.status.success());
+
+    let stdout = String::from_utf8_lossy(&command.stdout);
+    assert!(stdout.contains("scan plan:"));
+    assert!(stdout.contains("local_modules: localinfo, dcinfo, minidump"));
+
+    let _ = fs::remove_file(output);
+}
+
+#[test]
 fn records_alive_host_results_in_output() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let port = listener.local_addr().expect("addr").port();
@@ -917,13 +940,87 @@ fn rejects_missing_runtime_target() {
 #[test]
 fn rejects_conflicting_runtime_modes() {
     let command = Command::new(env!("CARGO_BIN_EXE_rscan"))
-        .args(["-h", "127.0.0.1", "-u", "http://127.0.0.1"])
+        .args(["-h", "127.0.0.1", "-local"])
         .output()
         .expect("command should run");
     assert!(!command.status.success());
 
     let stderr = String::from_utf8_lossy(&command.stderr);
     assert!(stderr.contains("error: scan target modes conflict"));
+    assert!(stderr.contains("用法: rscan"));
+}
+
+#[test]
+fn allows_host_and_url_targets_like_go() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request should arrive");
+        let mut buffer = [0u8; 4096];
+        let _ = stream.read(&mut buffer).expect("request should read");
+        let body = "<html><title>Kibana</title></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("response should write");
+    });
+
+    let output = temp_output("host-url-mixed");
+    let status = Command::new(env!("CARGO_BIN_EXE_rscan"))
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            "1",
+            "-u",
+            &format!("http://127.0.0.1:{port}"),
+            "-m",
+            "webtitle",
+            "-f",
+            "json",
+            "-o",
+            output.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .expect("command should run");
+    assert!(status.success());
+
+    server.join().expect("server should finish");
+
+    let content = read_output_compact(&output);
+    assert!(content.contains(r#""type":"SERVICE""#));
+    assert!(content.contains(&format!(r#""Url":"http://127.0.0.1:{port}/""#)));
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn rejects_invalid_scan_mode_entries() {
+    let command = Command::new(env!("CARGO_BIN_EXE_rscan"))
+        .args(["-h", "127.0.0.1", "-m", "ssh,invalid"])
+        .output()
+        .expect("command should run");
+    assert!(!command.status.success());
+
+    let stderr = String::from_utf8_lossy(&command.stderr);
+    assert!(stderr.contains("error: invalid scan mode: invalid"));
+    assert!(stderr.contains("用法: rscan"));
+}
+
+#[test]
+fn rejects_mixed_case_scan_mode_entries_like_go() {
+    let command = Command::new(env!("CARGO_BIN_EXE_rscan"))
+        .args(["-h", "127.0.0.1", "-m", "WebTitle"])
+        .output()
+        .expect("command should run");
+    assert!(!command.status.success());
+
+    let stderr = String::from_utf8_lossy(&command.stderr);
+    assert!(stderr.contains("error: invalid scan mode: WebTitle"));
     assert!(stderr.contains("用法: rscan"));
 }
 
@@ -1209,6 +1306,101 @@ fn scans_memcached_plugin_and_writes_vuln_result() {
     assert!(content.contains(r#""type":"PORT""#));
     assert!(content.contains(r#""type":"VULN""#));
     assert!(content.contains(r#""service":"memcached""#));
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn fs_args_take_precedence_over_cli_like_go() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("request should arrive");
+            let mut data = [0u8; 1024];
+            let size = stream.read(&mut data).expect("request should read");
+            let request = String::from_utf8_lossy(&data[..size]);
+            if request.starts_with("stats") {
+                stream
+                    .write_all(b"STAT pid 1\r\nEND\r\n")
+                    .expect("stats should write");
+            } else {
+                stream
+                    .write_all(b"VERSION 1.6.9\r\n")
+                    .expect("banner should write");
+            }
+        }
+    });
+
+    let output = temp_output("fs-args-precedence");
+    let fs_args = format!(
+        "-h 127.0.0.1 -p {port} -m memcached -f json -o {}",
+        output.to_string_lossy()
+    );
+    let status = Command::new(env!("CARGO_BIN_EXE_rscan"))
+        .env("FS_ARGS", fs_args)
+        .args(["-p", "1"])
+        .status()
+        .expect("command should run");
+    assert!(status.success());
+
+    server.join().expect("server should finish");
+
+    let content = read_output_compact(&output);
+    assert!(content.contains(r#""type":"PORT""#));
+    assert!(content.contains(r#""type":"VULN""#));
+    assert!(content.contains(r#""service":"memcached""#));
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn mixed_remote_and_local_modes_keep_remote_scan_like_go() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("request should arrive");
+            let mut data = [0u8; 1024];
+            let size = stream.read(&mut data).expect("request should read");
+            let request = String::from_utf8_lossy(&data[..size]);
+            if request.starts_with("stats") {
+                stream
+                    .write_all(b"STAT pid 1\r\nEND\r\n")
+                    .expect("stats should write");
+            } else {
+                stream
+                    .write_all(b"VERSION 1.6.9\r\n")
+                    .expect("banner should write");
+            }
+        }
+    });
+
+    let output = temp_output("memcached-localinfo-plugin");
+    let status = Command::new(env!("CARGO_BIN_EXE_rscan"))
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-m",
+            "memcached,localinfo",
+            "-f",
+            "json",
+            "-o",
+            output.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .expect("command should run");
+    assert!(status.success());
+
+    server.join().expect("server should finish");
+
+    let content = read_output_compact(&output);
+    assert!(content.contains(r#""type":"PORT""#));
+    assert!(content.contains(r#""type":"VULN""#));
+    assert!(content.contains(r#""service":"memcached""#));
+    assert!(content.contains(r#""status":"local-info""#));
     let _ = fs::remove_file(output);
 }
 
@@ -1614,7 +1806,7 @@ fn scans_activemq_plugin_and_writes_vuln_result() {
 }
 
 #[test]
-fn scans_rabbitmq_plugin_and_writes_vuln_result() {
+fn does_not_treat_http_management_api_as_rabbitmq_weak_password() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let port = listener.local_addr().expect("addr").port();
 
@@ -1626,10 +1818,8 @@ fn scans_rabbitmq_plugin_and_writes_vuln_result() {
         let (mut mq_stream, _) = listener.accept().expect("rabbitmq request should arrive");
         let mut buffer = [0u8; 4096];
         let size = mq_stream.read(&mut buffer).expect("request should read");
-        let request = String::from_utf8_lossy(&buffer[..size]).to_ascii_lowercase();
-        assert!(request.contains("get /api/overview "));
-        assert!(request.contains("authorization: basic z3vlc3q6z3vlc3q="));
-        let body = r#"{"management_version":"3.13"}"#;
+        assert!(size > 0);
+        let body = "{}";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -1662,9 +1852,8 @@ fn scans_rabbitmq_plugin_and_writes_vuln_result() {
 
     let content = read_output_compact(&output);
     assert!(content.contains(r#""type":"PORT""#));
-    assert!(content.contains(r#""type":"VULN""#));
-    assert!(content.contains(r#""service":"rabbitmq""#));
-    assert!(content.contains(r#""type":"weak-password""#));
+    assert!(!content.contains(r#""service":"rabbitmq""#));
+    assert!(!content.contains(r#""type":"weak-password""#));
     let _ = fs::remove_file(output);
 }
 
@@ -1908,20 +2097,12 @@ fn scans_ldap_tls_fallback_and_writes_vuln_result() {
 }
 
 #[test]
-fn scans_snmp_plugin_and_writes_vuln_result() {
+fn skips_snmp_plugin_without_explicit_hostport_like_go() {
     let socket = UdpSocket::bind("127.0.0.1:0").expect("socket should bind");
     let port = socket.local_addr().expect("addr").port();
-
-    let server = thread::spawn(move || {
-        let mut buffer = [0u8; 2048];
-        let (size, peer) = socket
-            .recv_from(&mut buffer)
-            .expect("request should arrive");
-        assert!(size > 0);
-        socket
-            .send_to(&snmp_response("public", "Mock SNMP"), peer)
-            .expect("response should write");
-    });
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+        .expect("socket timeout should set");
 
     let output = temp_output("snmp-plugin");
     let status = Command::new(env!("CARGO_BIN_EXE_rscan"))
@@ -1941,9 +2122,53 @@ fn scans_snmp_plugin_and_writes_vuln_result() {
         .expect("command should run");
     assert!(status.success());
 
+    let content = read_output_compact(&output);
+    let mut buffer = [0u8; 2048];
+    let err = socket
+        .recv_from(&mut buffer)
+        .expect_err("snmp request should not be sent");
+    assert!(matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut));
+    assert!(!content.contains(r#""service":"snmp""#));
+    assert!(!content.contains(r#""type":"weak-community""#));
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn scans_snmp_plugin_for_explicit_hostport_like_go() {
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("socket should bind");
+    let port = socket.local_addr().expect("addr").port();
+
+    let server = thread::spawn(move || {
+        let mut buffer = [0u8; 2048];
+        let (size, peer) = socket
+            .recv_from(&mut buffer)
+            .expect("request should arrive");
+        assert!(size > 0);
+        socket
+            .send_to(&snmp_response("public", "Mock SNMP"), peer)
+            .expect("response should write");
+    });
+
+    let output = temp_output("snmp-plugin-hostport");
+    let status = Command::new(env!("CARGO_BIN_EXE_rscan"))
+        .args([
+            "-h",
+            &format!("127.0.0.1:{port}"),
+            "-m",
+            "snmp",
+            "-f",
+            "json",
+            "-o",
+            output.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .expect("command should run");
+    assert!(status.success());
+
     server.join().expect("server should finish");
 
     let content = read_output_compact(&output);
+    assert!(content.contains(r#""type":"PORT""#));
     assert!(content.contains(r#""type":"VULN""#));
     assert!(content.contains(r#""service":"snmp""#));
     assert!(content.contains(r#""type":"weak-community""#));

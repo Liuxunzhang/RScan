@@ -1,4 +1,5 @@
 use aes::Aes128;
+use amiquip::Connection as AmqpConnection;
 use anyhow::{Context, Result};
 use base64::Engine;
 use cbc::Decryptor as Aes128CbcDecryptor;
@@ -264,6 +265,8 @@ pub struct RedisRuntimeOptions {
 pub struct AuthRuntimeOptions {
     pub domain: Option<String>,
     pub hashes: Vec<String>,
+    pub extra_usernames: Vec<String>,
+    pub extra_passwords: Vec<String>,
     pub disable_brute: bool,
 }
 
@@ -583,7 +586,7 @@ pub fn scan_services(
     context: &PluginContext,
 ) -> Result<Vec<PluginFinding>> {
     let selected = select_plugins(mode);
-    let explicit_mode = !mode.eq_ignore_ascii_case("all");
+    let explicit_mode = mode != "all";
     let tasks = build_service_scan_tasks(targets, &selected, explicit_mode);
     let service_runtime = current_service_scan_runtime_options();
     let auth_runtime = current_auth_runtime_options();
@@ -767,15 +770,35 @@ fn scan_service_task(
 }
 
 pub fn select_plugins(mode: &str) -> Vec<PluginDefinition> {
-    let mode = mode.to_ascii_lowercase();
     if mode == "all" {
         registered_plugins()
     } else {
-        registered_plugins()
+        let requested = parse_plugin_list(mode);
+        if requested.is_empty() {
+            return Vec::new();
+        }
+
+        let registry = registered_plugins()
             .into_iter()
-            .filter(|plugin| plugin.key == mode)
+            .map(|plugin| (plugin.key.to_string(), plugin))
+            .collect::<BTreeMap<_, _>>();
+
+        requested
+            .into_iter()
+            .filter_map(|item| registry.get(item.as_str()).cloned())
             .collect()
     }
+}
+
+fn parse_plugin_list(mode: &str) -> Vec<String> {
+    let mut parsed = Vec::new();
+    for item in mode.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let item = item.to_string();
+        if !parsed.contains(&item) {
+            parsed.push(item);
+        }
+    }
+    parsed
 }
 
 fn scan_ftp(target: &OpenService, context: &PluginContext) -> Result<Option<PluginFinding>> {
@@ -1245,10 +1268,21 @@ fn scan_rsync(target: &OpenService, context: &PluginContext) -> Result<Option<Pl
 }
 
 fn scan_rabbitmq(target: &OpenService, context: &PluginContext) -> Result<Option<PluginFinding>> {
+    scan_rabbitmq_with(target, context, rabbitmq_login)
+}
+
+fn scan_rabbitmq_with<F>(
+    target: &OpenService,
+    context: &PluginContext,
+    mut login: F,
+) -> Result<Option<PluginFinding>>
+where
+    F: FnMut(&OpenService, &str, &str, u64) -> Result<bool>,
+{
     if brute_force_disabled() {
         return Ok(None);
     }
-    if rabbitmq_login(target, "guest", "guest", context.timeout_secs)? {
+    if login(target, "guest", "guest", context.timeout_secs)? {
         return Ok(Some(PluginFinding {
             plugin: "rabbitmq".to_string(),
             target: target.clone(),
@@ -1268,7 +1302,7 @@ fn scan_rabbitmq(target: &OpenService, context: &PluginContext) -> Result<Option
             if username == "guest" && password == "guest" {
                 continue;
             }
-            if rabbitmq_login(target, &username, &password, context.timeout_secs)? {
+            if login(target, &username, &password, context.timeout_secs)? {
                 return Ok(Some(PluginFinding {
                     plugin: "rabbitmq".to_string(),
                     target: target.clone(),
@@ -1627,7 +1661,7 @@ fn scan_oracle_with<F>(
     mut login: F,
 ) -> Result<Option<PluginFinding>>
 where
-    F: FnMut(&OpenService, &str, &str, &str, u64) -> Result<bool>,
+    F: FnMut(&OpenService, &str, &str, &str, u64, bool) -> Result<bool>,
 {
     let mut attempted = BTreeSet::new();
 
@@ -1677,10 +1711,13 @@ fn oracle_attempt_service_names<F>(
     login: &mut F,
 ) -> Result<Option<PluginFinding>>
 where
-    F: FnMut(&OpenService, &str, &str, &str, u64) -> Result<bool>,
+    F: FnMut(&OpenService, &str, &str, &str, u64, bool) -> Result<bool>,
 {
     for service_name in ORACLE_COMMON_SERVICE_NAMES {
-        if login(target, username, password, service_name, timeout_secs)? {
+        if login(target, username, password, service_name, timeout_secs, false)?
+            || (username.eq_ignore_ascii_case("SYS")
+                && login(target, username, password, service_name, timeout_secs, true)?)
+        {
             return Ok(Some(PluginFinding {
                 plugin: "oracle".to_string(),
                 target: target.clone(),
@@ -2232,18 +2269,24 @@ fn default_usernames(service: &str) -> &'static [&'static str] {
 }
 
 fn usernames_for_service(service: &str, context: &PluginContext) -> Vec<String> {
-    if context.usernames.is_empty() {
+    let mut usernames = if context.usernames.is_empty() {
         default_usernames(service)
             .iter()
             .map(|value| (*value).to_string())
             .collect()
     } else {
         context.usernames.clone()
+    };
+    for username in current_auth_runtime_options().extra_usernames {
+        if !usernames.iter().any(|existing| existing == &username) {
+            usernames.push(username);
+        }
     }
+    usernames
 }
 
 fn passwords_for_user(username: Option<&str>, context: &PluginContext) -> Vec<String> {
-    let seeds: Vec<String> = if context.passwords.is_empty() {
+    let mut seeds: Vec<String> = if context.passwords.is_empty() {
         DEFAULT_PASSWORDS
             .iter()
             .map(|value| (*value).to_string())
@@ -2251,6 +2294,11 @@ fn passwords_for_user(username: Option<&str>, context: &PluginContext) -> Vec<St
     } else {
         context.passwords.clone()
     };
+    for password in current_auth_runtime_options().extra_passwords {
+        if !seeds.iter().any(|existing| existing == &password) {
+            seeds.push(password);
+        }
+    }
 
     let mut expanded = Vec::new();
     for password in seeds {
@@ -2844,23 +2892,34 @@ fn rabbitmq_login(
     password: &str,
     timeout_secs: u64,
 ) -> Result<bool> {
-    let client = Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(timeout_secs.max(1)))
-        .build()
-        .context("failed to build rabbitmq client")?;
+    let timeout_ms = timeout_secs.max(1) * 1000;
+    let username = percent_encode_amqp_credential(username);
+    let password = percent_encode_amqp_credential(password);
+    let url = format!(
+        "amqp://{username}:{password}@{}:{}/?connection_timeout={timeout_ms}",
+        target.host, target.port
+    );
 
-    for scheme in ["http", "https"] {
-        let url = format!("{scheme}://{}:{}/api/overview", target.host, target.port);
-        let response = client.get(&url).basic_auth(username, Some(password)).send();
-        if let Ok(response) = response {
-            if response.status().is_success() {
-                return Ok(true);
+    match AmqpConnection::insecure_open(&url) {
+        Ok(connection) => {
+            let _ = connection.close();
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+fn percent_encode_amqp_credential(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
             }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
         }
     }
-
-    Ok(false)
+    encoded
 }
 
 fn mongodb_unauthorized(target: &OpenService) -> Result<bool> {
@@ -4018,6 +4077,7 @@ fn oracle_login(
     password: &str,
     service_name: &str,
     timeout_secs: u64,
+    as_sysdba: bool,
 ) -> Result<bool> {
     let timeout = Duration::from_secs(timeout_secs.max(1));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4026,8 +4086,12 @@ fn oracle_login(
         .context("failed to build oracle runtime")?;
 
     runtime.block_on(async {
-        let config = OracleConfig::new(&target.host, target.port, service_name, username, password)
-            .connect_timeout(timeout);
+        let mut config =
+            OracleConfig::new(&target.host, target.port, service_name, username, password)
+                .connect_timeout(timeout);
+        if as_sysdba {
+            config = config.with_sysdba();
+        }
         match tokio::time::timeout(timeout, OracleConnection::connect_with_config(config)).await {
             Ok(Ok(connection)) => {
                 let _ = tokio::time::timeout(timeout, connection.close()).await;
@@ -5534,6 +5598,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             domain: Some("CORP".to_string()),
             hashes: Vec::new(),
             disable_brute: false,
+            ..AuthRuntimeOptions::default()
         });
 
         let mut attempts = Vec::new();
@@ -5619,11 +5684,68 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
     }
 
     #[test]
+    fn appends_additive_credentials_to_default_dictionaries_like_go() {
+        set_auth_runtime_options(AuthRuntimeOptions {
+            extra_usernames: vec!["guest".to_string()],
+            extra_passwords: vec!["Summer2024".to_string(), "{user}@2024".to_string()],
+            ..AuthRuntimeOptions::default()
+        });
+
+        let context = PluginContext {
+            usernames: Vec::new(),
+            passwords: Vec::new(),
+            timeout_secs: 2,
+            ssh_key_path: None,
+        };
+        let usernames = usernames_for_service("ssh", &context);
+        let passwords = passwords_for_user(Some("admin"), &context);
+
+        set_auth_runtime_options(AuthRuntimeOptions::default());
+
+        assert!(usernames.iter().any(|item| item == "root"));
+        assert!(usernames.iter().any(|item| item == "guest"));
+        assert!(passwords.iter().any(|item| item == "123456"));
+        assert!(passwords.iter().any(|item| item == "Summer2024"));
+        assert!(passwords.iter().any(|item| item == "admin@2024"));
+    }
+
+    #[test]
+    fn appends_additive_credentials_to_explicit_overrides_like_go() {
+        set_auth_runtime_options(AuthRuntimeOptions {
+            extra_usernames: vec!["guest".to_string()],
+            extra_passwords: vec!["Summer2024".to_string(), "{user}@2024".to_string()],
+            ..AuthRuntimeOptions::default()
+        });
+
+        let context = PluginContext {
+            usernames: vec!["operator".to_string()],
+            passwords: vec!["{user}@123".to_string()],
+            timeout_secs: 2,
+            ssh_key_path: None,
+        };
+        let usernames = usernames_for_service("ssh", &context);
+        let passwords = passwords_for_user(Some("operator"), &context);
+
+        set_auth_runtime_options(AuthRuntimeOptions::default());
+
+        assert_eq!(usernames, vec!["operator".to_string(), "guest".to_string()]);
+        assert_eq!(
+            passwords,
+            vec![
+                "operator@123".to_string(),
+                "Summer2024".to_string(),
+                "operator@2024".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn detects_smb2_hash_auth_with_domain_runtime_options() {
         set_auth_runtime_options(AuthRuntimeOptions {
             domain: Some("CORP".to_string()),
             hashes: vec!["0123456789abcdef0123456789abcdef".to_string()],
             disable_brute: false,
+            ..AuthRuntimeOptions::default()
         });
 
         let mut attempts = Vec::new();
@@ -5731,6 +5853,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             domain: Some("CORP".to_string()),
             hashes: Vec::new(),
             disable_brute: false,
+            ..AuthRuntimeOptions::default()
         });
 
         let mut attempts = Vec::new();
@@ -5828,6 +5951,13 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
         assert_eq!(ports_by_plugin["oracle"], vec![1521, 1522, 1526]);
         assert_eq!(ports_by_plugin["mysql"], vec![3306, 3307, 13306, 33306]);
         assert_eq!(ports_by_plugin["postgres"], vec![5432, 5433]);
+    }
+
+    #[test]
+    fn selects_comma_separated_plugins_like_go() {
+        let plugins = select_plugins("ssh, memcached, ssh");
+        let keys = plugins.into_iter().map(|plugin| plugin.key).collect::<Vec<_>>();
+        assert_eq!(keys, vec!["ssh".to_string(), "memcached".to_string()]);
     }
 
     #[test]
@@ -6520,7 +6650,39 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
     }
 
     #[test]
-    fn detects_rabbitmq_weak_password() {
+    fn detects_rabbitmq_weak_password_with_mock_connector() {
+        let mut attempts = Vec::new();
+        let finding = scan_rabbitmq_with(
+            &OpenService {
+                host: "127.0.0.1".to_string(),
+                port: 5672,
+            },
+            &PluginContext {
+                usernames: Vec::new(),
+                passwords: Vec::new(),
+                timeout_secs: 2,
+                ssh_key_path: None,
+            },
+            |_, username, password, _| {
+                attempts.push((username.to_string(), password.to_string()));
+                Ok(username == "guest" && password == "guest")
+            },
+        )
+        .expect("scan should succeed")
+        .expect("rabbitmq finding should exist");
+
+        assert_eq!(
+            attempts.first(),
+            Some(&("guest".to_string(), "guest".to_string()))
+        );
+        assert_eq!(finding.plugin, "rabbitmq");
+        assert_eq!(finding.status, "weak-password");
+        assert_eq!(finding.details["username"], json!("guest"));
+        assert_eq!(finding.details["password"], json!("guest"));
+    }
+
+    #[test]
+    fn does_not_treat_http_management_api_as_rabbitmq_auth() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let port = listener.local_addr().expect("local addr").port();
 
@@ -6556,11 +6718,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
 
         server.join().expect("server should finish");
 
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].plugin, "rabbitmq");
-        assert_eq!(findings[0].status, "weak-password");
-        assert_eq!(findings[0].details["username"], json!("guest"));
-        assert_eq!(findings[0].details["password"], json!("guest"));
+        assert!(findings.is_empty());
     }
 
     #[test]
@@ -7151,13 +7309,19 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                 timeout_secs: 2,
                 ssh_key_path: None,
             },
-            |_, username, password, service_name, _| {
+            |_, username, password, service_name, _, as_sysdba| {
                 attempts.push((
                     username.to_string(),
                     password.to_string(),
                     service_name.to_string(),
+                    as_sysdba,
                 ));
-                Ok(username == "ADMIN" && password == "admin@123" && service_name == "ORCL")
+                Ok(
+                    !as_sysdba
+                        && username == "ADMIN"
+                        && password == "admin@123"
+                        && service_name == "ORCL",
+                )
             },
         )
         .expect("scan should succeed")
@@ -7173,6 +7337,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             "ADMIN".to_string(),
             "admin@123".to_string(),
             "ORCL".to_string(),
+            false,
         )));
     }
 
@@ -7190,13 +7355,19 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                 timeout_secs: 2,
                 ssh_key_path: None,
             },
-            |_, username, password, service_name, _| {
+            |_, username, password, service_name, _, as_sysdba| {
                 attempts.push((
                     username.to_string(),
                     password.to_string(),
                     service_name.to_string(),
+                    as_sysdba,
                 ));
-                Ok(username == "SYS" && password == "123456" && service_name == "XE")
+                Ok(
+                    !as_sysdba
+                        && username == "SYS"
+                        && password == "123456"
+                        && service_name == "XE",
+                )
             },
         )
         .expect("scan should succeed")
@@ -7204,7 +7375,52 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
 
         assert_eq!(
             attempts.first(),
-            Some(&("SYS".to_string(), "123456".to_string(), "XE".to_string()))
+            Some(&("SYS".to_string(), "123456".to_string(), "XE".to_string(), false))
+        );
+        assert_eq!(finding.details["username"], json!("SYS"));
+        assert_eq!(finding.details["password"], json!("123456"));
+        assert_eq!(finding.details["service_name"], json!("XE"));
+    }
+
+    #[test]
+    fn retries_sys_credentials_with_sysdba_like_go() {
+        let mut attempts = Vec::new();
+        let finding = scan_oracle_with(
+            &OpenService {
+                host: "127.0.0.1".to_string(),
+                port: 1521,
+            },
+            &PluginContext {
+                usernames: Vec::new(),
+                passwords: Vec::new(),
+                timeout_secs: 2,
+                ssh_key_path: None,
+            },
+            |_, username, password, service_name, _, as_sysdba| {
+                attempts.push((
+                    username.to_string(),
+                    password.to_string(),
+                    service_name.to_string(),
+                    as_sysdba,
+                ));
+                Ok(
+                    username == "SYS"
+                        && password == "123456"
+                        && service_name == "XE"
+                        && as_sysdba,
+                )
+            },
+        )
+        .expect("scan should succeed")
+        .expect("oracle finding should exist");
+
+        assert_eq!(
+            attempts[0],
+            ("SYS".to_string(), "123456".to_string(), "XE".to_string(), false)
+        );
+        assert_eq!(
+            attempts[1],
+            ("SYS".to_string(), "123456".to_string(), "XE".to_string(), true)
         );
         assert_eq!(finding.details["username"], json!("SYS"));
         assert_eq!(finding.details["password"], json!("123456"));

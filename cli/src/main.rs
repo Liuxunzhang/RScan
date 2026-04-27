@@ -32,6 +32,10 @@ fn main() -> Result<()> {
     }
 
     let app = Application::new(config.clone());
+    if let Err(error) = app.validate_mode_selection() {
+        eprintln!("error: {error}\n\n{}", help_text_for(&config.runtime.language));
+        std::process::exit(2);
+    }
     if config.output.show_scan_plan {
         println!("{}", app.render_scan_plan()?);
     }

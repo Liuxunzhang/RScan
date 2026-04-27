@@ -36,4 +36,5 @@ codegen-units = 1
 panic = "abort"
 
 [patch.crates-io]
+oracle-rs = { path = "vendor/oracle-rs" }
 smb2 = { path = "vendor/smb2" }
