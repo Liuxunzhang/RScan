@@ -794,8 +794,14 @@ fn build_fingerprint_scan_result(service: &ServiceFingerprint) -> ScanResult {
         details.insert("version".to_string(), json!(version));
     }
     for (key, value) in &service.extras {
-        if matches!(key.as_str(), "product" | "os" | "info") {
-            details.insert(key.clone(), json!(value));
+        match key.as_str() {
+            "vendor_product" => {
+                details.insert("product".to_string(), json!(value));
+            }
+            "os" | "info" => {
+                details.insert(key.clone(), json!(value));
+            }
+            _ => {}
         }
     }
     ScanResult {
@@ -1304,7 +1310,7 @@ mod tests {
             service: "https".to_string(),
             version: None,
             banner: String::new(),
-            extras: BTreeMap::from([("product".to_string(), "nginx".to_string())]),
+            extras: BTreeMap::from([("vendor_product".to_string(), "nginx".to_string())]),
         });
 
         assert_eq!(result.kind, ResultType::Service);
@@ -1324,7 +1330,7 @@ mod tests {
             version: Some("1.0".to_string()),
             banner: "HTTP/1.1 200 OK".to_string(),
             extras: BTreeMap::from([
-                ("product".to_string(), "nginx".to_string()),
+                ("vendor_product".to_string(), "nginx".to_string()),
                 ("os".to_string(), "linux".to_string()),
                 ("info".to_string(), "reverse proxy".to_string()),
                 ("hostname".to_string(), "edge01".to_string()),

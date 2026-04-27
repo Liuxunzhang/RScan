@@ -998,8 +998,9 @@ fn build_match_result(
     let version_info = expand_version_info(&rule.version_info, captures);
     let mut extras = parse_version_fields(&version_info);
     let version = extras.remove("version");
-    if let Some(product) = extras.remove("vendor_product") {
-        extras.insert("product".to_string(), product);
+    let banner = trim_banner(response);
+    if rule.service == "microsoft-ds" && !banner.is_empty() {
+        extras.insert("hostname".to_string(), banner.clone());
     }
 
     ServiceFingerprint {
@@ -1007,7 +1008,7 @@ fn build_match_result(
         port: target.port,
         service: rule.service.clone(),
         version,
-        banner: trim_banner(response),
+        banner,
         extras,
     }
 }
@@ -1398,7 +1399,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
         let result = result.expect("probe rule should match");
         assert_eq!(result.service, "asterisk");
         assert_eq!(result.version.as_deref(), Some("18.5.0"));
-        assert_eq!(result.extras["product"], "Asterisk Call Manager");
+        assert_eq!(result.extras["vendor_product"], "Asterisk Call Manager");
     }
 
     #[test]
@@ -1442,7 +1443,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].service, "asterisk");
         assert_eq!(matches[0].version.as_deref(), Some("18.5.0"));
-        assert_eq!(matches[0].extras["product"], "Asterisk Call Manager");
+        assert_eq!(matches[0].extras["vendor_product"], "Asterisk Call Manager");
     }
 
     #[test]
@@ -1617,6 +1618,34 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             trim_banner(&response),
             "hostname: FILESRV domain: WORKGROUP"
         );
+    }
+
+    #[test]
+    fn copies_banner_into_microsoft_ds_hostname_like_go() {
+        let rule = MatchRule {
+            is_soft: false,
+            service: "microsoft-ds".to_string(),
+            regex: Regex::new("SMB").expect("regex should compile"),
+            version_info: String::new(),
+        };
+        let response = b"SMB banner\r\n";
+        let captures = rule
+            .regex
+            .captures(response)
+            .expect("response should match");
+
+        let result = build_match_result(
+            &ServiceFingerprintTarget {
+                host: "127.0.0.1".to_string(),
+                port: 445,
+            },
+            &rule,
+            &captures,
+            response,
+        );
+
+        assert_eq!(result.extras["hostname"], "SMB banner.");
+        assert_eq!(result.banner, "SMB banner.");
     }
 
     #[test]
