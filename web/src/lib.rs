@@ -8,13 +8,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 const MAX_TITLE_LENGTH: usize = 100;
 const NO_TITLE_TEXT: &str = "无标题";
 
 mod rules_asset {
     include!("../assets/rules.rs");
+}
+
+fn default_browser_user_agent() -> String {
+    obfstr::obfstr!(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+    )
+    .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +148,7 @@ fn fetch_target(
 fn send_request(client: &Client, url: &str, cookie: Option<&str>) -> Result<ResponseSnapshot> {
     let mut request = client
         .get(url)
-        .header(reqwest::header::USER_AGENT, USER_AGENT);
+        .header(reqwest::header::USER_AGENT, default_browser_user_agent());
     if let Some(cookie) = cookie.filter(|cookie| !cookie.is_empty()) {
         request = request.header(reqwest::header::COOKIE, cookie);
     }

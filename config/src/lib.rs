@@ -4,12 +4,20 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use thiserror::Error;
 
 pub const VERSION: &str = "2.0.1";
 pub const DEFAULT_OUTPUT_FILE: &str = "result.txt";
 pub const DEFAULT_MAIN_PORTS: &str = "21,22,23,80,81,110,135,139,143,389,443,445,502,873,993,995,1433,1521,3306,5432,5672,6379,7001,7687,8000,8005,8009,8080,8089,8443,9000,9042,9092,9200,10051,11211,15672,27017,61616";
 pub const DEFAULT_LOG_LEVEL: &str = "success";
+
+fn api_output_filename() -> String {
+    obfstr::obfstr!("rscanapi.csv").to_string()
+}
+
+static HELP_TEXT_EN: OnceLock<String> = OnceLock::new();
+static HELP_TEXT_ZH: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CommandAction {
@@ -277,7 +285,7 @@ impl OutputConfig {
                 .parent()
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
-            dir.join("rscanapi.csv")
+            dir.join(api_output_filename())
         } else {
             self.path.clone()
         }
@@ -856,7 +864,9 @@ pub fn help_text() -> &'static str {
 
 pub fn help_text_for(language: &str) -> &'static str {
     if language.eq_ignore_ascii_case("en") {
-        return "Usage: rscan [options]\n\
+        return HELP_TEXT_EN.get_or_init(|| {
+            obfstr::obfstr!(
+                "Usage: rscan [options]\n\
 \n\
 Targets:\n\
   -h <host>          Target host/CIDR/range\n\
@@ -905,10 +915,15 @@ Output/runtime:\n\
   -version           Show version\n\
 \n\
 Note: the parser intentionally accepts Go-style single-dash multi-letter flags\n\
-to stay compatible with the current rscan CLI.";
+ to stay compatible with the current rscan CLI."
+            )
+            .to_string()
+        });
     }
 
-    "用法: rscan [选项]\n\
+    HELP_TEXT_ZH.get_or_init(|| {
+        obfstr::obfstr!(
+            "用法: rscan [选项]\n\
 \n\
 目标:\n\
   -h <host>          目标主机/CIDR/范围\n\
@@ -957,7 +972,10 @@ to stay compatible with the current rscan CLI.";
   -version           显示版本\n\
 \n\
 说明: 解析器会保留 Go 风格的单横线多字符参数，\n\
-以兼容当前 rscan CLI。"
+  以兼容当前 rscan CLI。"
+        )
+        .to_string()
+    })
 }
 
 #[cfg(test)]

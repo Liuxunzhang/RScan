@@ -5,10 +5,9 @@ use rscan_net::{expand_targets, parse_ports, probe_live_hosts, scan_tcp_ports};
 use rscan_output::{ResultType, ScanResult};
 use rscan_platform::{collect_dc_info, collect_local_system_info, collect_minidump};
 use rscan_plugins::{
-    AuthRuntimeOptions, ConnectionRuntimeOptions, OpenService, PluginContext,
-    RedisRuntimeOptions, ServiceScanRuntimeOptions, scan_services, select_plugins,
-    set_auth_runtime_options, set_connection_runtime_options, set_redis_runtime_options,
-    set_service_scan_runtime_options,
+    AuthRuntimeOptions, ConnectionRuntimeOptions, OpenService, PluginContext, RedisRuntimeOptions,
+    ServiceScanRuntimeOptions, scan_services, select_plugins, set_auth_runtime_options,
+    set_connection_runtime_options, set_redis_runtime_options, set_service_scan_runtime_options,
 };
 use rscan_poc::{
     PocExecutionOptions, execute_pocs, filter_pocs, load_embedded_pocs, load_pocs_from_path,
@@ -740,9 +739,15 @@ pub struct ScanSummary {
 
 impl Display for ScanSummary {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let output_label = if self.output_enabled {
+            obfstr::obfstr!("enabled").to_string()
+        } else {
+            obfstr::obfstr!("disabled").to_string()
+        };
         write!(
             f,
-            "rscan workspace initialized (mode: {}, targets: {}, hosts: {}, alive_hosts: {}, ports: {}, excluded_hosts: {}, excluded_ports: {}, open_ports: {}, selected_plugins: {}, service_findings: {}, web_targets: {}, web_results: {}, local_results: {}, poc_targets: {}, selected_pocs: {}, poc_matches: {}, users: {}, passwords: {}, threads: {}, timeout: {}s, output: {})",
+            "{}(mode: {}, targets: {}, hosts: {}, alive_hosts: {}, ports: {}, excluded_hosts: {}, excluded_ports: {}, open_ports: {}, selected_plugins: {}, service_findings: {}, web_targets: {}, web_results: {}, local_results: {}, poc_targets: {}, selected_pocs: {}, poc_matches: {}, users: {}, passwords: {}, threads: {}, timeout: {}s, output: {})",
+            obfstr::obfstr!("rscan workspace initialized "),
             self.mode,
             self.target_count,
             self.expanded_host_count,
@@ -763,11 +768,7 @@ impl Display for ScanSummary {
             self.password_count,
             self.threads,
             self.timeout_secs,
-            if self.output_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
+            output_label
         )?;
         if !self.alive_subnets_16.is_empty() {
             write!(

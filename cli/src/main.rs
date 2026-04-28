@@ -5,6 +5,14 @@ use rscan_output::OutputManager;
 use std::thread;
 use std::time::Duration;
 
+fn discovered_prefix() -> String {
+    obfstr::obfstr!("discovered").to_string()
+}
+
+fn initialized_output_prefix() -> String {
+    obfstr::obfstr!("initialized output:").to_string()
+}
+
 fn main() -> Result<()> {
     let config = match AppConfig::from_env() {
         Ok(config) => config,
@@ -60,8 +68,9 @@ fn main() -> Result<()> {
                 String::new()
             };
             let line = format!(
-                "{}discovered {} {} {}",
+                "{}{} {} {} {}",
                 prefix,
+                discovered_prefix(),
                 result.kind.as_str(),
                 result.target,
                 result.status
@@ -78,7 +87,7 @@ fn main() -> Result<()> {
 
     if stdout_enabled {
         if let Some(path) = output.path() {
-            println!("initialized output: {}", path.display());
+            println!("{} {}", initialized_output_prefix(), path.display());
         }
         println!("{}", report.summary);
     }

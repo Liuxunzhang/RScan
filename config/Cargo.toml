@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+obfstr.workspace = true
 serde.workspace = true
 shlex.workspace = true
 thiserror.workspace = true

@@ -2371,6 +2371,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "obfstr"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0d354e9a302760d07e025701d40534f17dd1fe4c4db955b4e3bd2907c63bdee"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3277,6 +3283,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "obfstr",
  "rscan-config",
  "rscan-core",
  "rscan-output",
@@ -3291,6 +3298,7 @@ dependencies = [
 name = "rscan-config"
 version = "0.1.0"
 dependencies = [
+ "obfstr",
  "serde",
  "shlex",
  "thiserror 2.0.18",
@@ -3301,6 +3309,7 @@ name = "rscan-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "obfstr",
  "rscan-config",
  "rscan-fingerprint",
  "rscan-net",
@@ -3384,6 +3393,7 @@ dependencies = [
  "include_dir",
  "indexmap 2.14.0",
  "md5 0.8.0",
+ "obfstr",
  "rand 0.9.4",
  "regex",
  "reqwest",
@@ -3399,6 +3409,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "encoding_rs",
+ "obfstr",
  "regex",
  "reqwest",
  "rscan-config",
