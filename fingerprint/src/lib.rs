@@ -8,11 +8,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-#[cfg(test)]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-#[cfg(test)]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-#[cfg(test)]
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 
 const MAX_FAILURES: usize = 10;
@@ -85,11 +82,9 @@ struct ProbeDatabase {
     go_port_map: HashMap<u16, Vec<usize>>,
 }
 
-#[cfg(test)]
 #[derive(Debug)]
 struct NoCertificateVerification;
 
-#[cfg(test)]
 impl ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
@@ -596,7 +591,38 @@ fn read_initial_banner(
     plain_stream: &mut Option<TcpStream>,
 ) -> Result<Vec<u8>> {
     let stream = ensure_plain_stream(target, timeout, plain_stream)?;
-    read_available(stream)
+    match read_available(stream) {
+        Ok(banner) if !banner.is_empty() => Ok(banner),
+        Ok(banner) if is_common_ssl_port(target.port) => {
+            // Plain read returned empty on an SSL port — try TLS on a fresh connection.
+            if let Ok(mut tls) = connect_tls_stream(&target.host, target.port, timeout) {
+                if let Ok(tls_banner) = read_available(&mut tls) {
+                    if !tls_banner.is_empty() {
+                        return Ok(tls_banner);
+                    }
+                }
+            }
+            Ok(banner)
+        }
+        other => other,
+    }
+}
+
+fn is_common_ssl_port(port: u16) -> bool {
+    matches!(
+        port,
+        443   // HTTPS
+        | 465 // SMTPS
+        | 563 // NNTPS
+        | 636 // LDAPS
+        | 989 // FTPS data
+        | 990 // FTPS control
+        | 992 // TelnetS
+        | 993 // IMAPS
+        | 994 // IRCS
+        | 995 // POP3S
+        | 5061 // SIPS
+    )
 }
 
 fn execute_probe(
@@ -685,7 +711,6 @@ fn should_reconnect_plain_stream(error: &anyhow::Error) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
 fn connect_tls_stream(
     host: &str,
     port: u16,
@@ -704,7 +729,6 @@ fn connect_tls_stream(
     Ok(stream)
 }
 
-#[cfg(test)]
 fn tls_client_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| {
@@ -721,7 +745,6 @@ fn tls_client_config() -> Arc<ClientConfig> {
     }))
 }
 
-#[cfg(test)]
 fn tls_server_name(host: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(host.to_string()).context("invalid TLS server name")
 }

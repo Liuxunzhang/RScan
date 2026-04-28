@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use std::collections::{BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -102,42 +103,41 @@ pub fn scan_tcp_ports(
     timeout: Duration,
     concurrency: usize,
 ) -> Result<Vec<OpenPort>> {
-    let mut queue = VecDeque::new();
-    for host in hosts {
-        for port in ports {
-            queue.push_back((host.clone(), *port));
-        }
+    let hosts: Arc<Vec<String>> = Arc::from(hosts.to_vec());
+    let ports: Arc<Vec<u16>> = Arc::from(ports.to_vec());
+    let total = hosts.len().saturating_mul(ports.len());
+    if total == 0 {
+        return Ok(Vec::new());
     }
 
-    let queue = Arc::new(Mutex::new(queue));
+    let counter = Arc::new(AtomicUsize::new(0));
     let open_ports = Arc::new(Mutex::new(Vec::new()));
     let errors = Arc::new(Mutex::new(Vec::new()));
-    let worker_count = concurrency
-        .max(1)
-        .min(hosts.len().saturating_mul(ports.len()).max(1));
+    let worker_count = concurrency.max(1).min(total);
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
+            let hosts = Arc::clone(&hosts);
+            let ports = Arc::clone(&ports);
+            let counter = Arc::clone(&counter);
             let open_ports = Arc::clone(&open_ports);
             let errors = Arc::clone(&errors);
 
             scope.spawn(move || {
+                let ports_len = ports.len();
                 loop {
-                    let next = {
-                        let mut queue = queue.lock().expect("queue lock poisoned");
-                        queue.pop_front()
-                    };
-
-                    let Some((host, port)) = next else {
+                    let idx = counter.fetch_add(1, Ordering::Relaxed);
+                    if idx >= total {
                         break;
-                    };
+                    }
+                    let host = &hosts[idx / ports_len];
+                    let port = ports[idx % ports_len];
 
-                    match try_connect(&host, port, timeout) {
+                    match try_connect(host, port, timeout) {
                         Ok(true) => open_ports
                             .lock()
                             .expect("open port lock poisoned")
-                            .push(OpenPort { host, port }),
+                            .push(OpenPort { host: host.clone(), port }),
                         Ok(false) => {}
                         Err(error) => errors.lock().expect("error lock poisoned").push(error),
                     }
@@ -324,8 +324,15 @@ fn append_expanded_target(targets: &mut Vec<String>, spec: &str) -> Result<()> {
             continue;
         }
 
-        if item.parse::<Ipv4Addr>().is_ok() || looks_like_hostname(item) {
+        if item.parse::<Ipv4Addr>().is_ok() {
             append_unique(targets, [item.to_string()]);
+            continue;
+        }
+
+        if looks_like_hostname(item) {
+            let normalized = idna::domain_to_ascii(item)
+                .map_err(|_| anyhow!("invalid international domain name: {item}"))?;
+            append_unique(targets, [normalized]);
             continue;
         }
 
@@ -473,9 +480,9 @@ fn expand_full_range(start: Ipv4Addr, end: Ipv4Addr) -> Result<Vec<String>> {
 }
 
 fn looks_like_hostname(value: &str) -> bool {
-    value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+    value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-') || !ch.is_ascii()
+    })
 }
 
 fn is_ipv4_range(value: &str) -> bool {
@@ -608,6 +615,17 @@ mod tests {
 
         let _ = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)));
         let _ = handle.join();
+    }
+
+    #[test]
+    fn normalizes_international_domain_names_to_punycode() {
+        let result =
+            expand_targets(&["münchen.de".to_string()]).expect("idna target should expand");
+        assert_eq!(result, vec!["xn--mnchen-3ya.de"]);
+
+        let result =
+            expand_targets(&["日本語.jp".to_string()]).expect("idna target should expand");
+        assert_eq!(result, vec!["xn--wgv71a119e.jp"]);
     }
 
     #[test]

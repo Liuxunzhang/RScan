@@ -13,13 +13,12 @@ pub(crate) use serde_json::{Value, json};
 pub(crate) use sha1::{Digest, Sha1};
 use smb2::{ClientConfig as Smb2ClientConfig, SmbClient as Smb2Client};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryInto;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -84,6 +83,38 @@ mod telnet;
 use telnet::*;
 mod vnc;
 use vnc::*;
+
+
+// --- Plugin sub-modules ---
+mod ftp;
+mod smb;
+mod rdp_scan;
+mod ssh;
+mod telnet;
+mod smtp;
+mod imap;
+mod pop3;
+mod activemq;
+mod rsync;
+mod rabbitmq;
+mod mongodb;
+mod modbus;
+mod ldap;
+mod vnc;
+mod findnet;
+mod netbios;
+mod smbghost;
+mod kafka;
+mod snmp;
+mod mssql;
+mod oracle;
+mod mysql;
+mod postgres;
+mod neo4j;
+mod cassandra;
+mod redis;
+mod memcached;
+mod elasticsearch;
 
 
 const DEFAULT_PASSWORDS: &[&str] = &[
@@ -348,7 +379,7 @@ pub(crate) enum Smb2AuthMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
+pub pub(crate) enum Transport {
     Tcp,
     Udp,
 }
@@ -645,17 +676,14 @@ where
     }
 
     let worker_count = usize::from(runtime.module_threads.max(1)).min(tasks.len());
-    let total = tasks.len();
     let deadline = Some(Instant::now() + Duration::from_secs(runtime.global_timeout_secs));
-    let tasks = Arc::new(tasks);
-    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
     let findings = Arc::new(Mutex::new(Vec::new()));
     let errors = Arc::new(Mutex::new(Vec::new()));
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
-            let tasks = Arc::clone(&tasks);
-            let counter = Arc::clone(&counter);
+            let queue = Arc::clone(&queue);
             let findings = Arc::clone(&findings);
             let errors = Arc::clone(&errors);
             let auth_runtime = auth_runtime.clone();
@@ -675,13 +703,15 @@ where
                         }
                     }
 
-                    let idx = counter.fetch_add(1, Ordering::Relaxed);
-                    if idx >= total {
+                    let next = {
+                        let mut queue = queue.lock().expect("queue lock poisoned");
+                        queue.pop_front()
+                    };
+                    let Some(task) = next else {
                         break;
-                    }
-                    let task = &tasks[idx];
+                    };
 
-                    match scan_task(task) {
+                    match scan_task(&task) {
                         Ok(Some(finding)) => findings
                             .lock()
                             .expect("findings lock poisoned")
@@ -951,7 +981,7 @@ pub(crate) fn configure_stream(stream: TcpStream, timeout: Duration, address: &s
     Ok(stream)
 }
 
-pub(crate) fn tls_client_config() -> Arc<ClientConfig> {
+pub(crate) pub(crate) fn tls_client_config() -> Arc<ClientConfig> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     Arc::clone(CONFIG.get_or_init(|| {
         Arc::new(
@@ -971,7 +1001,7 @@ pub(crate) fn tls_server_name(host: &str) -> Result<ServerName<'static>> {
     ServerName::try_from(host.to_string()).context("invalid TLS server name")
 }
 
-pub(crate) fn connect_tls_stream(target: &OpenService, timeout: Duration) -> Result<ClientTlsStream> {
+pub(crate) pub(crate) fn connect_tls_stream(target: &OpenService, timeout: Duration) -> Result<ClientTlsStream> {
     let address = format!("{}:{}", target.host, target.port);
     let stream = connect_stream(target, timeout)?;
     let connection = ClientConnection::new(tls_client_config(), tls_server_name(&target.host)?)
