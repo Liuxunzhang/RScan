@@ -9,8 +9,12 @@ use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const USER_AGENT: &str = "Mozilla/5.0 (compatible; rscan/0.1.0)";
-const RULES_SOURCE: &str = include_str!("../assets/Rules.go");
+const OBFUSCATION_KEY: u8 = 0x5a;
+const USER_AGENT: &[u8] = &[
+    23, 53, 32, 51, 54, 54, 59, 117, 111, 116, 106, 122, 114, 57, 53, 55, 42, 59, 46, 51, 56, 54,
+    63, 97, 122, 40, 41, 57, 59, 52, 117, 106, 116, 107, 116, 106, 115,
+];
+include!(concat!(env!("OUT_DIR"), "/rules_obfuscated.rs"));
 const MAX_TITLE_LENGTH: usize = 100;
 const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
 const NO_TITLE_TEXT: &str = "无标题";
@@ -92,7 +96,7 @@ fn fetch_target(
 ) -> Result<WebScanResult> {
     let mut request = client
         .get(url)
-        .header(reqwest::header::USER_AGENT, USER_AGENT);
+        .header(reqwest::header::USER_AGENT, decode_obfuscated(USER_AGENT));
     if let Some(cookie) = cookie.filter(|cookie| !cookie.is_empty()) {
         request = request.header(reqwest::header::COOKIE, cookie);
     }
@@ -131,6 +135,14 @@ fn fetch_target(
         headers,
         fingerprints,
     })
+}
+
+fn decode_obfuscated(bytes: &[u8]) -> String {
+    let decoded = bytes
+        .iter()
+        .map(|byte| byte ^ OBFUSCATION_KEY)
+        .collect::<Vec<_>>();
+    String::from_utf8(decoded).expect("obfuscated string must be valid utf-8")
 }
 
 fn build_candidate_urls(target: &str) -> Vec<String> {
@@ -225,7 +237,7 @@ fn fingerprint_rules() -> &'static [FingerprintRule] {
 }
 
 fn parse_rules() -> Vec<FingerprintRule> {
-    RULES_SOURCE
+    rules_source()
         .lines()
         .filter_map(parse_rule_line)
         .filter_map(|(name, kind, rule)| {
@@ -242,6 +254,11 @@ fn parse_rules() -> Vec<FingerprintRule> {
             })
         })
         .collect()
+}
+
+fn rules_source() -> &'static str {
+    static DECODED: OnceLock<String> = OnceLock::new();
+    DECODED.get_or_init(|| decode_obfuscated(RULES_SOURCE))
 }
 
 fn parse_rule_line(line: &str) -> Option<(String, String, String)> {

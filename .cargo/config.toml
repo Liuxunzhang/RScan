@@ -1,0 +1,6 @@
+[build]
+rustflags = [
+  "--remap-path-prefix=/Users/liuxunzhang=/home/build",
+  "--remap-path-prefix=/Users/liuxunzhang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f=/crates",
+  "--remap-path-prefix=/Volumes/w/code/rscan=/src",
+]

@@ -619,22 +619,24 @@ pub struct ScanSummary {
 
 impl Display for ScanSummary {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
+        writeln!(
             f,
-            "rscan workspace initialized (mode: {}, targets: {}, hosts: {}, alive_hosts: {}, ports: {}, excluded_hosts: {}, excluded_ports: {}, open_ports: {}, selected_plugins: {}, service_findings: {}, web_targets: {}, web_results: {}, local_results: {}, poc_targets: {}, selected_pocs: {}, poc_matches: {}, users: {}, passwords: {}, threads: {}, timeout: {}s, output: {})",
+            "scan summary\n  mode: {}\n  scope: targets={}, hosts={}, ports={}\n  filters: excluded_hosts={}, excluded_ports={}\n  findings: alive_hosts={}, open_ports={}, module_findings={}, web_results={}, poc_matches={}, local_results={}\n  modules: selected_plugins={}\n  web: targets={}, identified={}\n  pocs: targets={}, selected={}, matches={}\n  auth: users={}, passwords={}\n  runtime: threads={}, timeout={}s\n  output: {}",
             self.mode,
             self.target_count,
             self.expanded_host_count,
-            self.host_result_count,
             self.port_count,
             self.excluded_host_count,
             self.excluded_port_count,
+            self.host_result_count,
             self.open_port_count,
-            self.selected_plugin_count,
             self.service_finding_count,
+            self.web_result_count,
+            self.poc_match_count,
+            self.local_result_count,
+            self.selected_plugin_count,
             self.web_target_count,
             self.web_result_count,
-            self.local_result_count,
             self.poc_target_count,
             self.selected_poc_count,
             self.poc_match_count,

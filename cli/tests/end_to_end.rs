@@ -987,7 +987,7 @@ fn prefixes_output_with_progress_when_requested() {
     server.join().expect("server should finish");
 
     let stdout = String::from_utf8_lossy(&command.stdout);
-    assert!(stdout.contains("[1/1] discovered PORT 127.0.0.1 open"));
+    assert!(stdout.contains(&format!("[1/1] PORT    127.0.0.1:{port}")));
 
     let _ = fs::remove_file(output);
 }

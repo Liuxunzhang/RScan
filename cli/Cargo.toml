@@ -10,13 +10,13 @@ anyhow.workspace = true
 rscan-config = { path = "../config" }
 rscan-core = { path = "../core" }
 rscan-output = { path = "../output" }
+serde_json.workspace = true
 
 [dev-dependencies]
 hex = "0.4.3"
 russh = "0.60.1"
 rustls = "0.23.38"
 rustls-pemfile = "2.2.0"
-serde_json.workspace = true
 tokio = { version = "1.52.1", features = ["net", "rt-multi-thread", "time"] }
 
 [[bin]]
