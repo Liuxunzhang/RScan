@@ -1,3 +1,5 @@
+use rustls::pki_types::PrivateKeyDer;
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use std::fs;
 use std::io::BufReader;
 use std::io::ErrorKind;
@@ -7,8 +9,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use rustls::pki_types::PrivateKeyDer;
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
 fn temp_output(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("rscan-e2e-{}-{}.json", name, std::process::id()));
@@ -127,14 +127,45 @@ fn tls_test_config() -> Arc<ServerConfig> {
             .expect("TLS key should parse")
             .expect("TLS key should exist");
         Arc::new(
-            ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
-                .with_safe_default_protocol_versions()
-                .expect("TLS protocol versions should be available")
-                .with_no_client_auth()
-                .with_single_cert(certs, key)
-                .expect("TLS server config should build"),
+            ServerConfig::builder_with_provider(
+                rustls::crypto::aws_lc_rs::default_provider().into(),
+            )
+            .with_safe_default_protocol_versions()
+            .expect("TLS protocol versions should be available")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("TLS server config should build"),
         )
     }))
+}
+
+fn complete_server_tls_handshake(
+    tls: &mut StreamOwned<ServerConnection, TcpStream>,
+    deadline: std::time::Instant,
+) -> bool {
+    let connection_deadline =
+        (std::time::Instant::now() + std::time::Duration::from_secs(1)).min(deadline);
+    while std::time::Instant::now() < connection_deadline {
+        match tls.conn.complete_io(&mut tls.sock) {
+            Ok(_) if !tls.conn.is_handshaking() => {
+                let _ = tls.sock.set_nonblocking(false);
+                return true;
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                if error.kind() != ErrorKind::Interrupted {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 struct TestSshHandler {
@@ -1384,7 +1415,7 @@ fn scans_smtp_tls_fallback_and_writes_vuln_result() {
     let config = tls_test_config();
 
     let server = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -1397,7 +1428,7 @@ fn scans_smtp_tls_fallback_and_writes_vuln_result() {
                     let conn =
                         ServerConnection::new(config.clone()).expect("server conn should build");
                     let mut tls = StreamOwned::new(conn, stream);
-                    if tls.conn.complete_io(&mut tls.sock).is_err() {
+                    if !complete_server_tls_handshake(&mut tls, deadline) {
                         continue;
                     }
 
@@ -1832,7 +1863,7 @@ fn scans_ldap_tls_fallback_and_writes_vuln_result() {
     let config = tls_test_config();
 
     let server = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -1845,7 +1876,7 @@ fn scans_ldap_tls_fallback_and_writes_vuln_result() {
                     let conn =
                         ServerConnection::new(config.clone()).expect("server conn should build");
                     let mut tls = StreamOwned::new(conn, stream);
-                    if tls.conn.complete_io(&mut tls.sock).is_err() {
+                    if !complete_server_tls_handshake(&mut tls, deadline) {
                         continue;
                     }
 
@@ -2484,7 +2515,11 @@ fn scans_postgres_plugin_and_writes_vuln_result() {
 fn scans_netbios_plugin_and_writes_service_result() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let port = listener.local_addr().expect("addr").port();
-    let udp = UdpSocket::bind("127.0.0.1:137").expect("udp should bind");
+    let udp = match UdpSocket::bind("127.0.0.1:137") {
+        Ok(udp) => udp,
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("udp should bind: {error}"),
+    };
 
     let udp_server = thread::spawn(move || {
         let mut request = [0u8; 128];

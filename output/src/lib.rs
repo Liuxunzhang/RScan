@@ -3,8 +3,8 @@ use rscan_config::{OutputConfig, OutputFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,10 +40,18 @@ pub struct ScanResult {
     pub details: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OutputManager {
     path: Option<PathBuf>,
     format: OutputFormat,
+    sink: Option<OutputSink>,
+}
+
+#[derive(Debug)]
+enum OutputSink {
+    Text(BufWriter<File>),
+    Json(BufWriter<File>),
+    Csv(csv::Writer<BufWriter<File>>),
 }
 
 impl OutputManager {
@@ -52,6 +60,7 @@ impl OutputManager {
             return Ok(Self {
                 path: None,
                 format: config.effective_format(),
+                sink: None,
             });
         }
 
@@ -60,22 +69,30 @@ impl OutputManager {
 
         ensure_parent_dir(&path)?;
 
-        match format {
-            OutputFormat::Txt | OutputFormat::Json => {
-                File::create(&path)
+        let sink = match format {
+            OutputFormat::Txt => {
+                let file = File::create(&path)
                     .with_context(|| format!("failed to create {}", path.display()))?;
+                OutputSink::Text(BufWriter::new(file))
+            }
+            OutputFormat::Json => {
+                let file = File::create(&path)
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+                OutputSink::Json(BufWriter::new(file))
             }
             OutputFormat::Csv => {
-                let mut writer = csv::Writer::from_path(&path)
+                let file = File::create(&path)
                     .with_context(|| format!("failed to create {}", path.display()))?;
+                let mut writer = csv::Writer::from_writer(BufWriter::new(file));
                 writer.write_record(["Time", "Type", "Target", "Status", "Details"])?;
-                writer.flush()?;
+                OutputSink::Csv(writer)
             }
-        }
+        };
 
         Ok(Self {
             path: Some(path),
             format,
+            sink: Some(sink),
         })
     }
 
@@ -83,14 +100,17 @@ impl OutputManager {
         self.path.as_deref()
     }
 
-    pub fn write_result(&self, result: &ScanResult) -> Result<()> {
-        let Some(path) = &self.path else {
+    pub fn format(&self) -> OutputFormat {
+        self.format
+    }
+
+    pub fn write_result(&mut self, result: &ScanResult) -> Result<()> {
+        let Some(sink) = &mut self.sink else {
             return Ok(());
         };
 
-        match self.format {
-            OutputFormat::Txt => {
-                let mut file = OpenOptions::new().append(true).open(path)?;
+        match sink {
+            OutputSink::Text(file) => {
                 let details = result
                     .details
                     .iter()
@@ -107,15 +127,11 @@ impl OutputManager {
                     details
                 )?;
             }
-            OutputFormat::Json => {
-                let mut file = OpenOptions::new().append(true).open(path)?;
-                serde_json::to_writer_pretty(&mut file, result)?;
+            OutputSink::Json(file) => {
+                serde_json::to_writer_pretty(file.by_ref(), result)?;
                 writeln!(file)?;
             }
-            OutputFormat::Csv => {
-                let mut writer = csv::WriterBuilder::new()
-                    .has_headers(false)
-                    .from_writer(OpenOptions::new().append(true).open(path)?);
+            OutputSink::Csv(writer) => {
                 writer.write_record([
                     result.time.as_str(),
                     result.kind.as_str(),
@@ -123,8 +139,20 @@ impl OutputManager {
                     result.status.as_str(),
                     serde_json::to_string(&result.details)?.as_str(),
                 ])?;
-                writer.flush()?;
             }
+        }
+
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        let Some(sink) = &mut self.sink else {
+            return Ok(());
+        };
+
+        match sink {
+            OutputSink::Text(file) | OutputSink::Json(file) => file.flush()?,
+            OutputSink::Csv(writer) => writer.flush()?,
         }
 
         Ok(())
@@ -166,7 +194,7 @@ mod tests {
         })
         .expect("manager should initialize");
 
-        assert_eq!(manager.format, OutputFormat::Csv);
+        assert_eq!(manager.format(), OutputFormat::Csv);
         assert_eq!(
             manager.path().expect("output path should exist"),
             Path::new("reports/fscanapi.csv")
@@ -180,7 +208,7 @@ mod tests {
             .expect("system time should be valid")
             .as_nanos();
         let path = std::env::temp_dir().join(format!("rscan-output-{unique}.json"));
-        let manager = OutputManager::initialize(&OutputConfig {
+        let mut manager = OutputManager::initialize(&OutputConfig {
             format: OutputFormat::Json,
             path: path.clone(),
             ..OutputConfig::default()
@@ -196,6 +224,7 @@ mod tests {
                 details: BTreeMap::from([("port".to_string(), json!(22))]),
             })
             .expect("json result should write");
+        manager.flush().expect("json result should flush");
 
         let content = fs::read_to_string(&path).expect("json output should exist");
         assert!(content.contains("\n  \"time\": \"2025-01-01T00:00:00Z\""));

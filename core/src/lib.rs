@@ -1,22 +1,25 @@
 use anyhow::Result;
-use rscan_config::AppConfig;
+use rscan_config::{AppConfig, WebConfig};
 use rscan_fingerprint::{ServiceFingerprint, ServiceFingerprintTarget, fingerprint_services};
 use rscan_net::{expand_targets, parse_ports, probe_live_hosts, scan_tcp_ports};
 use rscan_output::{ResultType, ScanResult};
 use rscan_platform::{collect_dc_info, collect_local_system_info, collect_minidump};
 use rscan_plugins::{
     AuthRuntimeOptions, ConnectionRuntimeOptions, Ms17010RuntimeOptions, OpenService,
-    PluginContext, RedisRuntimeOptions, ServiceScanRuntimeOptions, Transport, scan_services,
-    select_plugins, set_auth_runtime_options, set_connection_runtime_options,
-    set_ms17010_runtime_options, set_redis_runtime_options, set_service_scan_runtime_options,
+    PluginContext, RedisRuntimeOptions, ServiceScanRuntimeOptions, scan_services, select_plugins,
+    set_auth_runtime_options, set_connection_runtime_options, set_ms17010_runtime_options,
+    set_redis_runtime_options, set_service_scan_runtime_options,
 };
 use rscan_poc::{
-    PocExecutionOptions, execute_pocs, filter_pocs, load_embedded_pocs, load_pocs_from_path,
+    Poc, PocExecutionOptions, PocMatch, execute_pocs, filter_pocs, load_embedded_pocs,
+    load_pocs_from_path,
 };
-use rscan_web::{WebScanResult, scan_target};
+use rscan_web::{WebScanResult, WebScanner};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{self, Display, Formatter};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use time::{OffsetDateTime, macros::format_description};
 
@@ -156,7 +159,11 @@ impl Application {
         } else {
             Vec::new()
         };
-        results.extend(fingerprint_results.iter().map(build_fingerprint_scan_result));
+        results.extend(
+            fingerprint_results
+                .iter()
+                .map(build_fingerprint_scan_result),
+        );
         let service_plugin_defs = select_plugins(&mode);
         let service_targets = build_service_targets(
             &mode,
@@ -209,10 +216,11 @@ impl Application {
         } else {
             build_web_targets(&resolved.urls, &open_ports)?
         };
-        let web_results = web_targets
-            .iter()
-            .filter_map(|target| scan_target(target, &self.config.web).ok())
-            .collect::<Vec<_>>();
+        let web_results = scan_web_targets(
+            &web_targets,
+            &self.config.web,
+            usize::from(self.config.scan.threads),
+        );
         let web_result_count = web_results.len();
         results.extend(service_findings.into_iter().map(|finding| ScanResult {
             time: now_timestamp(),
@@ -243,13 +251,7 @@ impl Application {
                 socks5_proxy: self.config.web.socks5_proxy.clone(),
                 workers: usize::from(self.config.poc.workers),
             };
-            web_results
-                .iter()
-                .map(|target| execute_pocs(&target.final_url, &selected_pocs, &options))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
+            execute_pocs_for_targets(&web_results, &selected_pocs, &options)?
         };
         let poc_match_count = poc_matches.len();
         results.extend(poc_matches.into_iter().map(|poc| {
@@ -679,6 +681,130 @@ fn parse_ports_or_empty(spec: &str) -> Result<Vec<u16>> {
     }
 }
 
+fn scan_web_targets(
+    targets: &[String],
+    config: &WebConfig,
+    concurrency: usize,
+) -> Vec<WebScanResult> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(scanner) = WebScanner::new(config) else {
+        return Vec::new();
+    };
+    let worker_count = concurrency.max(1).min(targets.len());
+    let queue = Arc::new(Mutex::new(VecDeque::from(
+        targets.iter().cloned().enumerate().collect::<Vec<_>>(),
+    )));
+    let results = Arc::new(Mutex::new(Vec::new()));
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let results = Arc::clone(&results);
+            let scanner = scanner.clone();
+
+            scope.spawn(move || {
+                loop {
+                    let next = {
+                        let mut queue = queue.lock().expect("web target queue lock poisoned");
+                        queue.pop_front()
+                    };
+                    let Some((index, target)) = next else {
+                        break;
+                    };
+
+                    if let Ok(result) = scanner.scan_target(&target) {
+                        results
+                            .lock()
+                            .expect("web results lock poisoned")
+                            .push((index, result));
+                    }
+                }
+            });
+        }
+    });
+
+    let mut results = Arc::try_unwrap(results)
+        .expect("all web workers should exit")
+        .into_inner()
+        .expect("web results lock poisoned");
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+fn execute_pocs_for_targets(
+    targets: &[WebScanResult],
+    pocs: &[Poc],
+    options: &PocExecutionOptions,
+) -> Result<Vec<PocMatch>> {
+    if targets.is_empty() || pocs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total_workers = options.workers.max(1);
+    let target_workers = total_workers.min(targets.len());
+    let per_target_workers = (total_workers / target_workers).max(1);
+    let queue = Arc::new(Mutex::new(VecDeque::from(
+        targets
+            .iter()
+            .map(|target| target.final_url.clone())
+            .enumerate()
+            .collect::<Vec<_>>(),
+    )));
+    let matches = Arc::new(Mutex::new(Vec::new()));
+    let errors = Arc::new(Mutex::new(Vec::new()));
+
+    thread::scope(|scope| {
+        for _ in 0..target_workers {
+            let queue = Arc::clone(&queue);
+            let matches = Arc::clone(&matches);
+            let errors = Arc::clone(&errors);
+            let mut options = options.clone();
+            options.workers = per_target_workers;
+
+            scope.spawn(move || {
+                loop {
+                    let next = {
+                        let mut queue = queue.lock().expect("POC target queue lock poisoned");
+                        queue.pop_front()
+                    };
+                    let Some((index, target)) = next else {
+                        break;
+                    };
+
+                    match execute_pocs(&target, pocs, &options) {
+                        Ok(target_matches) => matches
+                            .lock()
+                            .expect("POC matches lock poisoned")
+                            .push((index, target_matches)),
+                        Err(error) => errors.lock().expect("POC errors lock poisoned").push(error),
+                    }
+                }
+            });
+        }
+    });
+
+    let errors = Arc::try_unwrap(errors)
+        .expect("all POC workers should exit")
+        .into_inner()
+        .expect("POC errors lock poisoned");
+    if let Some(error) = errors.into_iter().next() {
+        return Err(error);
+    }
+
+    let mut matches = Arc::try_unwrap(matches)
+        .expect("all POC workers should exit")
+        .into_inner()
+        .expect("POC matches lock poisoned");
+    matches.sort_by_key(|(index, _)| *index);
+    Ok(matches
+        .into_iter()
+        .flat_map(|(_, target_matches)| target_matches)
+        .collect())
+}
+
 fn exclude_hosts(hosts: Vec<String>, excluded_hosts: &[String]) -> Vec<String> {
     if excluded_hosts.is_empty() {
         return hosts;
@@ -731,7 +857,7 @@ fn build_web_targets(
 
 fn build_service_targets(
     mode: &str,
-    plugin_defs: &[rscan_plugins::PluginDefinition],
+    _plugin_defs: &[rscan_plugins::PluginDefinition],
     scan_hosts: &[String],
     scan_ports: &[u16],
     open_ports: &[rscan_net::OpenPort],
@@ -750,13 +876,6 @@ fn build_service_targets(
     }
 
     if mode.eq_ignore_ascii_case("all") {
-        return targets;
-    }
-
-    let has_udp_plugin = plugin_defs
-        .iter()
-        .any(|plugin| matches!(plugin.transport, Transport::Udp));
-    if !has_udp_plugin {
         return targets;
     }
 
@@ -1278,7 +1397,9 @@ mod tests {
 
         let server = thread::spawn(move || {
             let _ = listener.accept().expect("port probe should arrive");
-            let (mut stream, _) = listener.accept().expect("fingerprint connection should arrive");
+            let (mut stream, _) = listener
+                .accept()
+                .expect("fingerprint connection should arrive");
             thread::sleep(Duration::from_secs(4));
             stream
                 .write_all(b"SSH-2.0-OpenSSH_9.6\r\n")

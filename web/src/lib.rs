@@ -5,12 +5,14 @@ use reqwest::Proxy;
 use reqwest::blocking::{Client, ClientBuilder};
 use rscan_config::WebConfig;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 const USER_AGENT: &str = "Mozilla/5.0 (compatible; rscan/0.1.0)";
 const RULES_SOURCE: &str = include_str!("../assets/Rules.go");
 const MAX_TITLE_LENGTH: usize = 100;
+const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1024 * 1024;
 const NO_TITLE_TEXT: &str = "无标题";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,18 +28,41 @@ pub struct WebScanResult {
 }
 
 pub fn scan_target(target: &str, config: &WebConfig) -> Result<WebScanResult> {
-    let candidates = build_candidate_urls(target);
-    let client = build_client(config)?;
-    let mut last_error = None;
+    WebScanner::new(config)?.scan_target(target)
+}
 
-    for candidate in candidates {
-        match fetch_target(&client, target, &candidate, config.cookie.as_deref()) {
-            Ok(result) => return Ok(result),
-            Err(error) => last_error = Some(error),
-        }
+#[derive(Debug, Clone)]
+pub struct WebScanner {
+    config: WebConfig,
+    client: Client,
+}
+
+impl WebScanner {
+    pub fn new(config: &WebConfig) -> Result<Self> {
+        Ok(Self {
+            config: config.clone(),
+            client: build_client(config)?,
+        })
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("failed to scan web target: {target}")))
+    pub fn scan_target(&self, target: &str) -> Result<WebScanResult> {
+        let candidates = build_candidate_urls(target);
+        let mut last_error = None;
+
+        for candidate in candidates {
+            match fetch_target(
+                &self.client,
+                target,
+                &candidate,
+                self.config.cookie.as_deref(),
+            ) {
+                Ok(result) => return Ok(result),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("failed to scan web target: {target}")))
+    }
 }
 
 fn build_client(config: &WebConfig) -> Result<Client> {
@@ -84,9 +109,14 @@ fn fetch_target(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let headers = collect_headers(response.headers());
-    let body = response
-        .bytes()
+    let mut body = Vec::new();
+    response
+        .take((MAX_RESPONSE_BODY_BYTES + 1) as u64)
+        .read_to_end(&mut body)
         .with_context(|| format!("failed to read response body for {url}"))?;
+    if body.len() > MAX_RESPONSE_BODY_BYTES {
+        body.truncate(MAX_RESPONSE_BODY_BYTES);
+    }
     let body_text = decode_body(&body);
     let title = extract_title(&body_text);
     let fingerprints = match_fingerprints(&body_text, &headers);

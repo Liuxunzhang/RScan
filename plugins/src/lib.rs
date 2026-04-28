@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::TryInto;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -222,6 +222,7 @@ const NETBIOS_NEGOTIATE_TWO: &[u8] = &[
     0xA2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x05, 0x02, 0xCE, 0x0E, 0x00, 0x00, 0x00, 0x0F, 0x00,
 ];
+const TLS_FALLBACK_PLAINTEXT_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct NetBiosInfo {
@@ -682,12 +683,12 @@ where
                             .expect("findings lock poisoned")
                             .push(finding),
                         Ok(None) => {}
-                        Err(scan_error) => errors.lock().expect("errors lock poisoned").push(
-                            format!(
+                        Err(scan_error) => {
+                            errors.lock().expect("errors lock poisoned").push(format!(
                                 "scan error {}:{} [{}] - {scan_error}",
                                 task.target.host, task.target.port, task.plugin_key
-                            ),
-                        ),
+                            ))
+                        }
                     }
                 }
             });
@@ -1132,7 +1133,8 @@ fn scan_pop3(target: &OpenService, context: &PluginContext) -> Result<Option<Plu
     }
     for username in usernames_for_service("pop3", context) {
         for password in passwords_for_user(Some(username.as_str()), context) {
-            let (authenticated, tls) = pop3_login(target, &username, &password, context.timeout_secs)?;
+            let (authenticated, tls) =
+                pop3_login(target, &username, &password, context.timeout_secs)?;
             if authenticated {
                 return Ok(Some(PluginFinding {
                     plugin: "pop3".to_string(),
@@ -2595,20 +2597,34 @@ fn smtp_login(
     timeout_secs: u64,
 ) -> Result<bool> {
     let timeout = Duration::from_secs(timeout_secs.max(1));
-    match connect_stream(target, timeout) {
-        Ok(mut stream) => match smtp_login_with_stream(&mut stream, username, password) {
-            Ok(true) => Ok(true),
-            Ok(false) => Ok(false),
-            Err(_) => {
-                let mut tls_stream = connect_tls_stream(target, timeout)?;
-                smtp_login_with_stream(&mut tls_stream, username, password)
-            }
+    match smtp_plain_login_attempt(
+        target,
+        username,
+        password,
+        tls_fallback_plaintext_probe_timeout(timeout),
+    ) {
+        Ok(result) => Ok(result),
+        Err(_) => match connect_tls_stream(target, timeout)
+            .and_then(|mut stream| smtp_login_with_stream(&mut stream, username, password))
+        {
+            Ok(result) => Ok(result),
+            Err(_) => smtp_plain_login_attempt(target, username, password, timeout),
         },
-        Err(_) => {
-            let mut tls_stream = connect_tls_stream(target, timeout)?;
-            smtp_login_with_stream(&mut tls_stream, username, password)
-        }
     }
+}
+
+fn smtp_plain_login_attempt(
+    target: &OpenService,
+    username: &str,
+    password: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    let mut stream = connect_stream(target, timeout)?;
+    let result = smtp_login_with_stream(&mut stream, username, password);
+    if result.is_err() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    result
 }
 
 fn smtp_login_with_stream<S>(stream: &mut S, username: &str, password: &str) -> Result<bool>
@@ -2638,10 +2654,7 @@ where
 
     let auth_payload =
         base64::engine::general_purpose::STANDARD.encode(format!("\u{0}{username}\u{0}{password}"));
-    write_and_flush_io(
-        stream,
-        format!("AUTH PLAIN {auth_payload}\r\n").as_bytes(),
-    )?;
+    write_and_flush_io(stream, format!("AUTH PLAIN {auth_payload}\r\n").as_bytes())?;
     let auth_response = read_smtp_response(stream)?;
     if !smtp_code_is(&auth_response, 235) {
         return Ok(false);
@@ -2741,7 +2754,10 @@ fn pop3_login(
     }
 
     let mut tls_stream = connect_tls_stream(target, timeout)?;
-    Ok((pop3_login_with_stream(&mut tls_stream, username, password)?, true))
+    Ok((
+        pop3_login_with_stream(&mut tls_stream, username, password)?,
+        true,
+    ))
 }
 
 fn pop3_login_with_stream<S>(stream: &mut S, username: &str, password: &str) -> Result<bool>
@@ -2957,20 +2973,34 @@ fn ldap_bind_and_search(
     timeout_secs: u64,
 ) -> Result<bool> {
     let timeout = Duration::from_secs(timeout_secs.max(1));
-    match connect_stream(target, timeout) {
-        Ok(mut stream) => match ldap_bind_and_search_with_stream(&mut stream, username, password) {
-            Ok(true) => Ok(true),
-            Ok(false) => Ok(false),
-            Err(_) => {
-                let mut tls_stream = connect_tls_stream(target, timeout)?;
-                ldap_bind_and_search_with_stream(&mut tls_stream, username, password)
-            }
+    match ldap_plain_bind_and_search_attempt(
+        target,
+        username,
+        password,
+        tls_fallback_plaintext_probe_timeout(timeout),
+    ) {
+        Ok(result) => Ok(result),
+        Err(_) => match connect_tls_stream(target, timeout).and_then(|mut stream| {
+            ldap_bind_and_search_with_stream(&mut stream, username, password)
+        }) {
+            Ok(result) => Ok(result),
+            Err(_) => ldap_plain_bind_and_search_attempt(target, username, password, timeout),
         },
-        Err(_) => {
-            let mut tls_stream = connect_tls_stream(target, timeout)?;
-            ldap_bind_and_search_with_stream(&mut tls_stream, username, password)
-        }
     }
+}
+
+fn ldap_plain_bind_and_search_attempt(
+    target: &OpenService,
+    username: &str,
+    password: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    let mut stream = connect_stream(target, timeout)?;
+    let result = ldap_bind_and_search_with_stream(&mut stream, username, password);
+    if result.is_err() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    result
 }
 
 fn ldap_bind_and_search_with_stream<S>(
@@ -5052,6 +5082,10 @@ fn connect_stream(target: &OpenService, timeout: Duration) -> Result<TcpStream> 
     connect_stream_with(&socket, timeout, &address, TcpStream::connect_timeout)
 }
 
+fn tls_fallback_plaintext_probe_timeout(timeout: Duration) -> Duration {
+    timeout.min(TLS_FALLBACK_PLAINTEXT_PROBE_TIMEOUT)
+}
+
 fn connect_stream_with<F>(
     socket: &std::net::SocketAddr,
     timeout: Duration,
@@ -5127,7 +5161,9 @@ fn write_and_flush_io<S>(stream: &mut S, payload: &[u8]) -> Result<()>
 where
     S: Write,
 {
-    stream.write_all(payload).context("failed to write request")?;
+    stream
+        .write_all(payload)
+        .context("failed to write request")?;
     stream.flush().context("failed to flush request")
 }
 
@@ -5234,14 +5270,14 @@ fn read_available_bytes(stream: &mut TcpStream) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::{ServerConfig, ServerConnection};
     use std::fs;
     use std::io::{BufReader, ErrorKind};
-    use std::net::{TcpListener, UdpSocket};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use rustls::pki_types::PrivateKeyDer;
-    use rustls::{ServerConfig, ServerConnection};
 
     const TEST_SSH_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\n\
@@ -5340,6 +5376,34 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                 .expect("TLS server config should build"),
             )
         }))
+    }
+
+    fn complete_server_tls_handshake(
+        tls: &mut StreamOwned<ServerConnection, TcpStream>,
+        deadline: Instant,
+    ) -> bool {
+        let connection_deadline = (Instant::now() + Duration::from_secs(1)).min(deadline);
+        while Instant::now() < connection_deadline {
+            match tls.conn.complete_io(&mut tls.sock) {
+                Ok(_) if !tls.conn.is_handshaking() => {
+                    let _ = tls.sock.set_nonblocking(false);
+                    return true;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) =>
+                {
+                    if error.kind() != ErrorKind::Interrupted {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        false
     }
 
     struct TestSshHandler {
@@ -6114,10 +6178,10 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
-                        if tls.conn.complete_io(&mut tls.sock).is_err() {
+                        if !complete_server_tls_handshake(&mut tls, deadline) {
                             continue;
                         }
 
@@ -6134,7 +6198,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         let size = tls.read(&mut buffer).expect("mail from should read");
                         let request = String::from_utf8_lossy(&buffer[..size]);
                         assert!(request.contains("MAIL FROM:<test@test.com>"));
-                        tls.write_all(b"250 OK\r\n").expect("mail response should write");
+                        tls.write_all(b"250 OK\r\n")
+                            .expect("mail response should write");
                         tls.flush().expect("response should flush");
                         return;
                     }
@@ -6242,10 +6307,10 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
-                        if tls.conn.complete_io(&mut tls.sock).is_err() {
+                        if !complete_server_tls_handshake(&mut tls, deadline) {
                             continue;
                         }
                         tls.write_all(b"+OK POP3 ready\r\n")
@@ -6364,10 +6429,10 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
-                        if tls.conn.complete_io(&mut tls.sock).is_err() {
+                        if !complete_server_tls_handshake(&mut tls, deadline) {
                             continue;
                         }
                         tls.write_all(b"* OK IMAP ready\r\n")
@@ -6719,10 +6784,10 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
-                        if tls.conn.complete_io(&mut tls.sock).is_err() {
+                        if !complete_server_tls_handshake(&mut tls, deadline) {
                             continue;
                         }
 
@@ -6731,8 +6796,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         let request = &buffer[..size];
                         assert!(request.windows(3).any(|window| window == b"\x02\x01\x03"));
                         tls.write_all(&[
-                            0x30, 0x0c, 0x02, 0x01, 0x01, 0x61, 0x07, 0x0a, 0x01, 0x00, 0x04,
-                            0x00, 0x04, 0x00,
+                            0x30, 0x0c, 0x02, 0x01, 0x01, 0x61, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00,
+                            0x04, 0x00,
                         ])
                         .expect("bind response should write");
 
@@ -6740,8 +6805,8 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         let request = &buffer[..size];
                         assert!(request.contains(&0x63));
                         tls.write_all(&[
-                            0x30, 0x0c, 0x02, 0x01, 0x02, 0x65, 0x07, 0x0a, 0x01, 0x00, 0x04,
-                            0x00, 0x04, 0x00,
+                            0x30, 0x0c, 0x02, 0x01, 0x02, 0x65, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00,
+                            0x04, 0x00,
                         ])
                         .expect("search response should write");
                         tls.flush().expect("response should flush");
@@ -7841,7 +7906,11 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
     fn detects_netbios_identification() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let port = listener.local_addr().expect("local addr").port();
-        let udp = UdpSocket::bind("127.0.0.1:137").expect("udp should bind");
+        let udp = match UdpSocket::bind("127.0.0.1:137") {
+            Ok(udp) => udp,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("udp should bind: {error}"),
+        };
 
         let udp_server = thread::spawn(move || {
             let mut request = [0u8; 128];

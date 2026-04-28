@@ -27,7 +27,10 @@ fn main() -> Result<()> {
     }
 
     if let Err(error) = config.validate_run_mode() {
-        eprintln!("error: {error}\n\n{}", help_text_for(&config.runtime.language));
+        eprintln!(
+            "error: {error}\n\n{}",
+            help_text_for(&config.runtime.language)
+        );
         std::process::exit(2);
     }
 
@@ -36,7 +39,7 @@ fn main() -> Result<()> {
         println!("{}", app.render_scan_plan()?);
     }
 
-    let output = OutputManager::initialize(&config.output)?;
+    let mut output = OutputManager::initialize(&config.output)?;
     let stdout_enabled = should_write_stdout(&config);
     let report = app.run()?;
 
@@ -65,6 +68,7 @@ fn main() -> Result<()> {
             }
         }
     }
+    output.flush()?;
 
     if stdout_enabled {
         if let Some(path) = output.path() {

@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use std::collections::{BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -102,42 +103,42 @@ pub fn scan_tcp_ports(
     timeout: Duration,
     concurrency: usize,
 ) -> Result<Vec<OpenPort>> {
-    let mut queue = VecDeque::new();
-    for host in hosts {
-        for port in ports {
-            queue.push_back((host.clone(), *port));
-        }
+    if hosts.is_empty() || ports.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let queue = Arc::new(Mutex::new(queue));
+    let total_tasks = hosts.len().saturating_mul(ports.len());
+    let next_index = AtomicUsize::new(0);
     let open_ports = Arc::new(Mutex::new(Vec::new()));
     let errors = Arc::new(Mutex::new(Vec::new()));
-    let worker_count = concurrency
-        .max(1)
-        .min(hosts.len().saturating_mul(ports.len()).max(1));
+    let worker_count = concurrency.max(1).min(total_tasks);
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
+            let next_index = &next_index;
             let open_ports = Arc::clone(&open_ports);
             let errors = Arc::clone(&errors);
 
             scope.spawn(move || {
                 loop {
-                    let next = {
-                        let mut queue = queue.lock().expect("queue lock poisoned");
-                        queue.pop_front()
-                    };
-
-                    let Some((host, port)) = next else {
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= total_tasks {
                         break;
-                    };
+                    }
 
-                    match try_connect(&host, port, timeout) {
-                        Ok(true) => open_ports
-                            .lock()
-                            .expect("open port lock poisoned")
-                            .push(OpenPort { host, port }),
+                    let host = &hosts[index / ports.len()];
+                    let port = ports[index % ports.len()];
+
+                    match try_connect(host, port, timeout) {
+                        Ok(true) => {
+                            open_ports
+                                .lock()
+                                .expect("open port lock poisoned")
+                                .push(OpenPort {
+                                    host: host.clone(),
+                                    port,
+                                })
+                        }
                         Ok(false) => {}
                         Err(error) => errors.lock().expect("error lock poisoned").push(error),
                     }
@@ -551,7 +552,8 @@ mod tests {
 
     #[test]
     fn expands_large_full_ranges_without_error() {
-        let hosts = expand_targets(&["10.0.0.0-10.1.0.0".to_string()]).expect("range should expand");
+        let hosts =
+            expand_targets(&["10.0.0.0-10.1.0.0".to_string()]).expect("range should expand");
         assert_eq!(hosts.len(), 65_537);
         assert_eq!(hosts.first().map(String::as_str), Some("10.0.0.0"));
         assert_eq!(hosts.last().map(String::as_str), Some("10.1.0.0"));

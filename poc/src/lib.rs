@@ -8,11 +8,11 @@ use reqwest::Proxy;
 use reqwest::blocking::{Client, ClientBuilder};
 use rhai::{Blob, Dynamic, Engine as RhaiEngine, ImmutableString, Map, Scope};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -459,17 +459,17 @@ fn evaluate_expression(
         return Ok(false);
     }
 
-    let engine = rhai_engine();
-    let transformed = preprocess_expression(expr);
+    let transformed = cached_preprocess_expression(expr);
     let mut scope = Scope::new();
     scope.push_dynamic("response", response.as_dynamic());
     for (key, value) in vars {
         scope.push_dynamic(key.clone(), parse_variable_value(value));
     }
-    let value = engine
-        .eval_with_scope::<bool>(&mut scope, &transformed)
-        .map_err(|error| anyhow!("failed to evaluate expression `{expr}`: {error}"))?;
-    Ok(value)
+    RHAI_ENGINE.with(|engine| {
+        engine
+            .eval_with_scope::<bool>(&mut scope, &transformed)
+            .map_err(|error| anyhow!("failed to evaluate expression `{expr}`: {error}"))
+    })
 }
 
 fn parse_variable_value(value: &str) -> Dynamic {
@@ -480,7 +480,11 @@ fn parse_variable_value(value: &str) -> Dynamic {
     }
 }
 
-fn rhai_engine() -> RhaiEngine {
+thread_local! {
+    static RHAI_ENGINE: RhaiEngine = build_rhai_engine();
+}
+
+fn build_rhai_engine() -> RhaiEngine {
     let mut engine = RhaiEngine::new();
     engine.register_fn("bcontains", |left: Blob, right: Blob| {
         left.windows(right.len())
@@ -540,6 +544,27 @@ fn rhai_engine() -> RhaiEngine {
     });
     engine.register_fn("wait", |_reverse: Dynamic, _seconds: i64| false);
     engine
+}
+
+fn cached_preprocess_expression(expression: &str) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(transformed) = cache
+        .lock()
+        .expect("expression cache lock poisoned")
+        .get(expression)
+        .cloned()
+    {
+        return transformed;
+    }
+
+    let transformed = preprocess_expression(expression);
+    cache
+        .lock()
+        .expect("expression cache lock poisoned")
+        .insert(expression.to_string(), transformed.clone());
+    transformed
 }
 
 fn preprocess_expression(expression: &str) -> String {
