@@ -31,8 +31,9 @@ thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["formatting", "macros", "local-offset"] }
 
 [profile.release]
-strip = "symbols"
-lto = "thin"
+strip = true
+lto = true
+opt-level = "z"
 codegen-units = 1
 panic = "abort"
 
