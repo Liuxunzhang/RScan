@@ -5,10 +5,10 @@ use rscan_net::{expand_targets, parse_ports, probe_live_hosts, scan_tcp_ports};
 use rscan_output::{ResultType, ScanResult};
 use rscan_platform::{collect_dc_info, collect_local_system_info, collect_minidump};
 use rscan_plugins::{
-    AuthRuntimeOptions, ConnectionRuntimeOptions, Ms17010RuntimeOptions, OpenService,
-    PluginContext, RedisRuntimeOptions, ServiceScanRuntimeOptions, scan_services, select_plugins,
-    set_auth_runtime_options, set_connection_runtime_options, set_ms17010_runtime_options,
-    set_redis_runtime_options, set_service_scan_runtime_options,
+    AuthRuntimeOptions, ConnectionRuntimeOptions, OpenService, PluginContext,
+    RedisRuntimeOptions, ServiceScanRuntimeOptions, scan_services, select_plugins,
+    set_auth_runtime_options, set_connection_runtime_options, set_redis_runtime_options,
+    set_service_scan_runtime_options,
 };
 use rscan_poc::{
     PocExecutionOptions, execute_pocs, filter_pocs, load_embedded_pocs, load_pocs_from_path,
@@ -187,9 +187,6 @@ impl Application {
                 redis_write_path: self.config.redis.redis_write_path.clone(),
                 redis_write_content: self.config.redis.redis_write_content.clone(),
                 redis_write_file: self.config.redis.redis_write_file.clone(),
-            });
-            set_ms17010_runtime_options(Ms17010RuntimeOptions {
-                shellcode: self.config.runtime.shellcode.clone(),
             });
             set_connection_runtime_options(ConnectionRuntimeOptions {
                 max_retries: self.config.scan.max_retries,
@@ -2427,7 +2424,7 @@ mod tests {
                 .expect("scan should run");
 
         assert_eq!(report.summary.local_result_count, 1);
-        assert_eq!(report.summary.selected_plugin_count, 34);
+        assert_eq!(report.summary.selected_plugin_count, 33);
         assert!(report.results.iter().any(|result| {
             result.kind == ResultType::Service
                 && result.status == "local-info"

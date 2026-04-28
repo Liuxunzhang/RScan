@@ -1,4 +1,4 @@
-name: poc-yaml-hikvision-unauthenticated-rce-cve-2021-36260
+name: poc-yaml-hikvision-unauthenticated-rce
 set:
   r1: randomLowercase(5)
   r2: randomLowercase(5)
@@ -30,4 +30,3 @@ detail:
   author: york
   links:
     - https://watchfulip.github.io/2021/09/18/Hikvision-IP-Camera-Unauthenticated-RCE.html
-    - https://github.com/Aiminsun/CVE-2021-36260

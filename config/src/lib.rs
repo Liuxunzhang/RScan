@@ -286,14 +286,12 @@ impl OutputConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    pub shellcode: Option<String>,
     pub language: String,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            shellcode: None,
             language: "zh".to_string(),
         }
     }
@@ -523,9 +521,6 @@ impl AppConfig {
                     config.output.secret_key = Some(value_for(flag, inline_value, &mut iter)?);
                 }
 
-                "-sc" | "--sc" => {
-                    config.runtime.shellcode = Some(value_for(flag, inline_value, &mut iter)?);
-                }
                 "-lang" | "--lang" => {
                     config.runtime.language = value_for(flag, inline_value, &mut iter)?;
                 }
@@ -905,7 +900,6 @@ Output/runtime:\n\
   -slow              Slow log output\n\
   -api <addr>        API endpoint; forces csv output to rscanapi.csv\n\
   -secret <key>      API secret key\n\
-  -sc <shellcode>    Shellcode option\n\
   -lang <lang>       Language (default: zh)\n\
   -help              Show help\n\
   -version           Show version\n\
@@ -958,7 +952,6 @@ to stay compatible with the current rscan CLI.";
   -slow              慢速日志输出\n\
   -api <addr>        API 地址; 会强制输出到 rscanapi.csv\n\
   -secret <key>      API 密钥\n\
-  -sc <shellcode>    Shellcode 选项\n\
   -lang <lang>       语言 (默认: zh)\n\
   -help              显示帮助\n\
   -version           显示版本\n\

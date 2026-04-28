@@ -559,45 +559,6 @@ fn redis_read_command(stream: &mut TcpStream) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
-fn ms17010_negotiate_request() -> Vec<u8> {
-    hex::decode("00000085ff534d4272000000001853c80000000000000000000000000000fffe00000000006200025043204e4554574f524b2050524f4752414d20312e3000024c414e4d414e312e30000257696e646f777320666f7220576f726b67726f75707320332e316100024c4d312e325830303200024c414e4d414e322e3100024e54204c4d20302e313200").expect("valid request")
-}
-
-fn ms17010_session_setup_request() -> Vec<u8> {
-    hex::decode("00000088ff534d4273000000001807c80000000000000000000000000000fffe000040000cff000a01044132000000000000004a0000000000d40000a0cf00604806062b0601050502a03e303ca00e300c060a2b06010401823702020aa22a04284e544c4d5353500001000000078208a200000000000000000000000000000000000502ce0e0000000f00").expect("valid request")
-}
-
-fn ms17010_tree_connect_request(host: &str, user_id: [u8; 2]) -> Vec<u8> {
-    let ipc_path = format!(r"\\{}\IPC$", host);
-    let byte_count = 1 + ipc_path.len() + 1 + 6;
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    packet.extend_from_slice(b"\xFFSMB");
-    packet.push(0x75);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x18, 0x01, 0x20, 0x00, 0x00]);
-    packet.extend_from_slice(&[0x00; 8]);
-    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x2F, 0x4B]);
-    packet.extend_from_slice(&user_id);
-    packet.extend_from_slice(&[0xC5, 0x5E]);
-    packet.extend_from_slice(&[0x04, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00]);
-    packet.extend_from_slice(&(byte_count as u16).to_le_bytes());
-    packet.push(0x00);
-    packet.extend_from_slice(ipc_path.as_bytes());
-    packet.push(0x00);
-    packet.extend_from_slice(b"?????\0");
-    let length = (packet.len() - 4) as u32;
-    packet[1..4].copy_from_slice(&length.to_be_bytes()[1..4]);
-    packet
-}
-
-fn ms17010_trans_named_pipe_request() -> Vec<u8> {
-    hex::decode("0000004aff534d42250000000018012800000000000000000000000088ea30108529810000000000ffffffff0000000000000000000000004a0000004a000200230000000070005c504950455c00").expect("valid request")
-}
-
-fn ms17010_trans2_session_setup_request() -> Vec<u8> {
-    hex::decode("0000004eff534d4232000000001807c00000000000000000000000008fffe0000841000f0c0000000010000000000000000a6d9a400000000c00420000004e0001000e000d0000000000000000000000000000").expect("valid request")
-}
-
 fn findnet_test_payload(hostname: &str, addresses: &[&str]) -> Vec<u8> {
     let mut payload = utf16le_bytes(hostname);
     payload.extend_from_slice(&[0, 0]);
@@ -655,66 +616,6 @@ fn netbios_ntlm_response() -> Vec<u8> {
     response[items_start..items_start + items.len()].copy_from_slice(&items);
     response.extend_from_slice(&utf16le_bytes("Windows Server 2022|"));
     response
-}
-
-fn ms17010_negotiate_response() -> Vec<u8> {
-    let mut response = vec![0u8; 36];
-    response[4..8].copy_from_slice(b"SMB\x72");
-    response
-}
-
-fn ms17010_session_response(user_id: [u8; 2], os: &str) -> Vec<u8> {
-    let byte_count = os.len() + 2;
-    let mut response = vec![0u8; 45 + byte_count];
-    response[4..8].copy_from_slice(b"SMB\x73");
-    response[32..34].copy_from_slice(&user_id);
-    response[36] = 1;
-    response[43..45].copy_from_slice(&(byte_count as u16).to_le_bytes());
-    response[46..46 + os.len()].copy_from_slice(os.as_bytes());
-    response
-}
-
-fn ms17010_tree_response(tree_id: [u8; 2]) -> Vec<u8> {
-    let mut response = vec![0u8; 36];
-    response[4..8].copy_from_slice(b"SMB\x75");
-    response[28..30].copy_from_slice(&tree_id);
-    response
-}
-
-fn ms17010_named_pipe_response(vulnerable: bool) -> Vec<u8> {
-    let mut response = vec![0u8; 36];
-    response[4..8].copy_from_slice(b"SMB\x25");
-    if vulnerable {
-        response[9..13].copy_from_slice(&[0x05, 0x02, 0x00, 0xC0]);
-    }
-    response
-}
-
-fn ms17010_backdoor_response(backdoor: bool) -> Vec<u8> {
-    let mut response = vec![0u8; 36];
-    response[4..8].copy_from_slice(b"SMB\x32");
-    if backdoor {
-        response[34] = 0x51;
-    }
-    response
-}
-
-fn ms17010_tree_connect_request_for(host: &str, user_id: [u8; 2]) -> Vec<u8> {
-    ms17010_tree_connect_request(host, user_id)
-}
-
-fn ms17010_trans_named_pipe_request_for(tree_id: [u8; 2], user_id: [u8; 2]) -> Vec<u8> {
-    let mut request = ms17010_trans_named_pipe_request();
-    request[28..30].copy_from_slice(&tree_id);
-    request[32..34].copy_from_slice(&user_id);
-    request
-}
-
-fn ms17010_trans2_session_setup_request_for(tree_id: [u8; 2], user_id: [u8; 2]) -> Vec<u8> {
-    let mut request = ms17010_trans2_session_setup_request();
-    request[28..30].copy_from_slice(&tree_id);
-    request[32..34].copy_from_slice(&user_id);
-    request
 }
 
 #[test]
@@ -2970,92 +2871,6 @@ fn scans_smbghost_plugin_and_writes_vuln_result() {
     assert!(content.contains(r#""type":"VULN""#));
     assert!(content.contains(r#""service":"smb""#));
     assert!(content.contains(r#""type":"cve-2020-0796""#));
-    let _ = fs::remove_file(output);
-}
-
-#[test]
-fn scans_ms17010_plugin_and_writes_vuln_result() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-    let port = listener.local_addr().expect("addr").port();
-
-    let server = thread::spawn(move || {
-        let (_probe_stream, _) = listener.accept().expect("port probe should arrive");
-
-        let (mut smb_stream, _) = listener.accept().expect("ms17010 request should arrive");
-
-        let mut negotiate = vec![0u8; ms17010_negotiate_request().len()];
-        smb_stream
-            .read_exact(&mut negotiate)
-            .expect("negotiate should read");
-        assert_eq!(negotiate, ms17010_negotiate_request());
-        smb_stream
-            .write_all(&ms17010_negotiate_response())
-            .expect("negotiate response should write");
-
-        let mut session = vec![0u8; ms17010_session_setup_request().len()];
-        smb_stream
-            .read_exact(&mut session)
-            .expect("session should read");
-        assert_eq!(session, ms17010_session_setup_request());
-        let user_id = [0x34, 0x12];
-        smb_stream
-            .write_all(&ms17010_session_response(user_id, "Windows Server 2012 R2"))
-            .expect("session response should write");
-
-        let mut tree = vec![0u8; ms17010_tree_connect_request("127.0.0.1", user_id).len()];
-        smb_stream.read_exact(&mut tree).expect("tree should read");
-        assert_eq!(tree, ms17010_tree_connect_request_for("127.0.0.1", user_id));
-        let tree_id = [0x78, 0x56];
-        smb_stream
-            .write_all(&ms17010_tree_response(tree_id))
-            .expect("tree response should write");
-
-        let mut pipe = vec![0u8; ms17010_trans_named_pipe_request().len()];
-        smb_stream.read_exact(&mut pipe).expect("pipe should read");
-        assert_eq!(pipe, ms17010_trans_named_pipe_request_for(tree_id, user_id));
-        smb_stream
-            .write_all(&ms17010_named_pipe_response(true))
-            .expect("pipe response should write");
-
-        let mut trans2 = vec![0u8; ms17010_trans2_session_setup_request().len()];
-        smb_stream
-            .read_exact(&mut trans2)
-            .expect("trans2 should read");
-        assert_eq!(
-            trans2,
-            ms17010_trans2_session_setup_request_for(tree_id, user_id)
-        );
-        smb_stream
-            .write_all(&ms17010_backdoor_response(true))
-            .expect("backdoor response should write");
-    });
-
-    let output = temp_output("ms17010-plugin");
-    let status = Command::new(env!("CARGO_BIN_EXE_rscan"))
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-            "-m",
-            "ms17010",
-            "-f",
-            "json",
-            "-o",
-            output.to_string_lossy().as_ref(),
-        ])
-        .status()
-        .expect("command should run");
-    assert!(status.success());
-
-    server.join().expect("server should finish");
-
-    let content = read_output_compact(&output);
-    assert!(content.contains(r#""type":"PORT""#));
-    assert!(content.contains(r#""type":"VULN""#));
-    assert!(content.contains(r#""service":"smb""#));
-    assert!(content.contains(r#""vulnerability":"MS17-010""#));
-    assert!(content.contains(r#""backdoor":"DOUBLEPULSAR""#));
     let _ = fs::remove_file(output);
 }
 

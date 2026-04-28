@@ -63,6 +63,5 @@ target/release/rscan
 - `fingerprint/assets/port_map.rs`
 - `web/assets/rules.rs`
 - `poc/embedded-pocs/`
-- `plugins/assets/ms17010_presets.rs`
 
 因此将本目录单独复制或初始化为新的 Git 仓库后，代码不再依赖外层旧仓库目录。

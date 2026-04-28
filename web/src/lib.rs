@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const USER_AGENT: &str = "Mozilla/5.0 (compatible; rscan/0.1.0)";
+const USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 const MAX_TITLE_LENGTH: usize = 100;
 const NO_TITLE_TEXT: &str = "无标题";
 

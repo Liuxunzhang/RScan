@@ -63,6 +63,5 @@ The workspace now vendors the compatibility resources it needs:
 - `fingerprint/assets/port_map.rs`
 - `web/assets/rules.rs`
 - `poc/embedded-pocs/`
-- `plugins/assets/ms17010_presets.rs`
 
 That means this directory can be copied out or initialized as its own Git repository without requiring the outer legacy repository tree.

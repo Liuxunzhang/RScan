@@ -17,6 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static EMBEDDED_POCS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/embedded-pocs");
+const DEFAULT_BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Poc {
@@ -368,6 +370,13 @@ fn execute_rule(
     }
     for (key, value) in &rule.headers {
         request = request.header(key, apply_template(value, vars));
+    }
+    if !rule
+        .headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("user-agent"))
+    {
+        request = request.header(reqwest::header::USER_AGENT, DEFAULT_BROWSER_USER_AGENT);
     }
     if !rule.body.is_empty() {
         request = request.body(apply_template(&rule.body, vars));
