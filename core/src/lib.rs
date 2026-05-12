@@ -2,7 +2,7 @@ use anyhow::Result;
 use rscan_config::{AppConfig, WebConfig};
 use rscan_fingerprint::{ServiceFingerprint, ServiceFingerprintTarget, fingerprint_services};
 use rscan_net::{expand_targets, parse_ports, probe_live_hosts, scan_tcp_ports};
-use rscan_output::{ResultType, ScanResult};
+use rscan_output::{ResultType, ScanResult, keys};
 use rscan_platform::{collect_dc_info, collect_local_system_info, collect_minidump};
 use rscan_plugins::{
     AuthRuntimeOptions, ConnectionRuntimeOptions, Ms17010RuntimeOptions, OpenService,
@@ -110,7 +110,7 @@ impl Application {
                     kind: ResultType::Host,
                     target: alive.host.clone(),
                     status: "alive".to_string(),
-                    details: BTreeMap::from([("protocol".to_string(), json!(alive.protocol))]),
+                    details: BTreeMap::from([(keys::PROTOCOL.to_string(), json!(alive.protocol))]),
                 }));
                 alive_hosts = liveness
                     .alive_hosts
@@ -142,7 +142,7 @@ impl Application {
             kind: ResultType::Port,
             target: open.host.clone(),
             status: "open".to_string(),
-            details: BTreeMap::from([("port".to_string(), json!(open.port))]),
+            details: BTreeMap::from([(keys::PORT.to_string(), json!(open.port))]),
         }));
         let fingerprint_results = if self.config.scan.enable_fingerprint && !open_ports.is_empty() {
             fingerprint_services(
@@ -255,12 +255,12 @@ impl Application {
         };
         let poc_match_count = poc_matches.len();
         results.extend(poc_matches.into_iter().map(|poc| {
-            let mut details = BTreeMap::from([("poc".to_string(), json!(poc.poc_name))]);
+            let mut details = BTreeMap::from([(keys::POC.to_string(), json!(poc.poc_name))]);
             if let Some(group) = poc.group.filter(|group| !group.is_empty()) {
-                details.insert("group".to_string(), json!(group));
+                details.insert(keys::GROUP.to_string(), json!(group));
             }
             if !poc.variables.is_empty() {
-                details.insert("variables".to_string(), json!(poc.variables));
+                details.insert(keys::VARIABLES.to_string(), json!(poc.variables));
             }
             ScanResult {
                 time: now_timestamp(),
@@ -376,26 +376,26 @@ fn selected_web_modules(mode: &str) -> Vec<String> {
 fn build_local_info_result() -> Result<ScanResult> {
     let local = collect_local_system_info()?;
     let mut details = BTreeMap::from([
-        ("hostname".to_string(), json!(local.hostname)),
-        ("username".to_string(), json!(local.username)),
-        ("os".to_string(), json!(local.os)),
-        ("arch".to_string(), json!(local.arch)),
+        (keys::HOSTNAME.to_string(), json!(local.hostname)),
+        (keys::USERNAME.to_string(), json!(local.username)),
+        (keys::OS.to_string(), json!(local.os)),
+        (keys::ARCH.to_string(), json!(local.arch)),
     ]);
     if let Some(home_dir) = local.home_dir {
         details.insert(
-            "home_dir".to_string(),
+            keys::HOME_DIR.to_string(),
             json!(home_dir.to_string_lossy().to_string()),
         );
     }
     if let Some(current_dir) = local.current_dir {
         details.insert(
-            "current_dir".to_string(),
+            keys::CURRENT_DIR.to_string(),
             json!(current_dir.to_string_lossy().to_string()),
         );
     }
     if !local.sensitive_files.is_empty() {
         details.insert(
-            "sensitive_files".to_string(),
+            keys::SENSITIVE_FILES.to_string(),
             json!(
                 local
                     .sensitive_files
@@ -425,11 +425,11 @@ fn build_minidump_result() -> Result<Option<ScanResult>> {
         target: "localhost".to_string(),
         status: "minidump-created".to_string(),
         details: BTreeMap::from([
-            ("service".to_string(), json!("minidump")),
-            ("process_name".to_string(), json!(minidump.process_name)),
-            ("pid".to_string(), json!(minidump.pid)),
+            (keys::SERVICE.to_string(), json!("minidump")),
+            (keys::PROCESS_NAME.to_string(), json!(minidump.process_name)),
+            (keys::PID.to_string(), json!(minidump.pid)),
             (
-                "output_path".to_string(),
+                keys::OUTPUT_PATH.to_string(),
                 json!(minidump.output_path.to_string_lossy().to_string()),
             ),
         ]),
@@ -447,10 +447,10 @@ fn build_dcinfo_result() -> Result<Option<ScanResult>> {
         target: "localhost".to_string(),
         status: "dcinfo".to_string(),
         details: BTreeMap::from([
-            ("service".to_string(), json!("dcinfo")),
-            ("domain".to_string(), json!(dcinfo.domain)),
+            (keys::SERVICE.to_string(), json!("dcinfo")),
+            (keys::DOMAIN.to_string(), json!(dcinfo.domain)),
             (
-                "domain_controllers".to_string(),
+                keys::DOMAIN_CONTROLLERS.to_string(),
                 json!(dcinfo.domain_controllers),
             ),
         ]),
@@ -905,22 +905,25 @@ fn now_timestamp() -> String {
 
 fn build_fingerprint_scan_result(service: &ServiceFingerprint) -> ScanResult {
     let mut details = BTreeMap::from([
-        ("port".to_string(), json!(service.port)),
-        ("service".to_string(), json!(service.service.clone())),
+        (keys::PORT.to_string(), json!(service.port)),
+        (keys::SERVICE.to_string(), json!(service.service.clone())),
     ]);
     if !service.banner.is_empty() {
-        details.insert("banner".to_string(), json!(service.banner.clone()));
+        details.insert(keys::BANNER.to_string(), json!(service.banner.clone()));
     }
     if let Some(version) = &service.version {
-        details.insert("version".to_string(), json!(version));
+        details.insert(keys::VERSION.to_string(), json!(version));
     }
     for (key, value) in &service.extras {
         match key.as_str() {
             "vendor_product" => {
-                details.insert("product".to_string(), json!(value));
+                details.insert(keys::PRODUCT.to_string(), json!(value));
             }
-            "os" | "info" => {
-                details.insert(key.clone(), json!(value));
+            "os" => {
+                details.insert(keys::OS.to_string(), json!(value));
+            }
+            "info" => {
+                details.insert(keys::INFO.to_string(), json!(value));
             }
             _ => {}
         }
@@ -936,28 +939,28 @@ fn build_fingerprint_scan_result(service: &ServiceFingerprint) -> ScanResult {
 
 fn build_web_scan_result(web: &WebScanResult) -> ScanResult {
     let mut server_info = BTreeMap::from([
-        ("title".to_string(), json!(web.title.clone())),
-        ("length".to_string(), json!(web.length.clone())),
-        ("status_code".to_string(), json!(web.status_code)),
+        (keys::TITLE.to_string(), json!(web.title.clone())),
+        (keys::LENGTH.to_string(), json!(web.length.clone())),
+        (keys::STATUS_CODE.to_string(), json!(web.status_code)),
     ]);
     if web.requested_url != web.final_url {
-        server_info.insert("redirect_Url".to_string(), json!(web.final_url.clone()));
+        server_info.insert(keys::REDIRECT_URL.to_string(), json!(web.final_url.clone()));
     }
     for (key, value) in &web.headers {
         server_info.insert(key.to_lowercase(), json!(value));
     }
 
     let mut details = BTreeMap::from([
-        ("service".to_string(), json!("http")),
-        ("title".to_string(), json!(web.title.clone())),
-        ("Url".to_string(), json!(web.final_url.clone())),
-        ("status_code".to_string(), json!(web.status_code)),
-        ("length".to_string(), json!(web.length.clone())),
-        ("server_info".to_string(), json!(server_info)),
-        ("fingerprints".to_string(), json!(web.fingerprints.clone())),
+        (keys::SERVICE.to_string(), json!("http")),
+        (keys::TITLE.to_string(), json!(web.title.clone())),
+        (keys::URL.to_string(), json!(web.final_url.clone())),
+        (keys::STATUS_CODE.to_string(), json!(web.status_code)),
+        (keys::LENGTH.to_string(), json!(web.length.clone())),
+        (keys::SERVER_INFO.to_string(), json!(server_info)),
+        (keys::FINGERPRINTS.to_string(), json!(web.fingerprints.clone())),
     ]);
     if let Some(port) = web_result_port(&web.final_url) {
-        details.insert("port".to_string(), json!(port));
+        details.insert(keys::PORT.to_string(), json!(port));
     }
 
     ScanResult {

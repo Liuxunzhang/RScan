@@ -380,38 +380,51 @@ fn expand_cidr(cidr: &str) -> Result<Vec<String>> {
 }
 
 fn sample_subnet8(base_ip: Ipv4Addr) -> Vec<String> {
+    use std::collections::HashSet;
     let first_octet = base_ip.octets()[0];
+    let mut seen = HashSet::with_capacity(674);
     let mut hosts = Vec::with_capacity(674);
     let common_second_octets = [0u8, 1, 2, 10, 100, 200, 254];
 
     for second_octet in common_second_octets {
         for third_octet in (0u8..=250).step_by(10) {
-            hosts.push(Ipv4Addr::new(first_octet, second_octet, third_octet, 1).to_string());
-            hosts.push(Ipv4Addr::new(first_octet, second_octet, third_octet, 254).to_string());
-            hosts.push(
-                Ipv4Addr::new(
-                    first_octet,
-                    second_octet,
-                    third_octet,
-                    sampled_host_octet(first_octet, second_octet, third_octet, 0),
-                )
-                .to_string(),
-            );
+            let ip1 = Ipv4Addr::new(first_octet, second_octet, third_octet, 1).to_string();
+            if seen.insert(ip1.clone()) {
+                hosts.push(ip1);
+            }
+            let ip2 = Ipv4Addr::new(first_octet, second_octet, third_octet, 254).to_string();
+            if seen.insert(ip2.clone()) {
+                hosts.push(ip2);
+            }
+            let ip3 = Ipv4Addr::new(
+                first_octet,
+                second_octet,
+                third_octet,
+                sampled_host_octet(first_octet, second_octet, third_octet, 0),
+            )
+            .to_string();
+            if seen.insert(ip3.clone()) {
+                hosts.push(ip3);
+            }
         }
     }
 
     for second_octet in (0u8..=224).step_by(32) {
         for third_octet in (0u8..=224).step_by(32) {
-            hosts.push(Ipv4Addr::new(first_octet, second_octet, third_octet, 1).to_string());
-            hosts.push(
-                Ipv4Addr::new(
-                    first_octet,
-                    second_octet,
-                    third_octet,
-                    sampled_host_octet(first_octet, second_octet, third_octet, 1),
-                )
-                .to_string(),
-            );
+            let ip1 = Ipv4Addr::new(first_octet, second_octet, third_octet, 1).to_string();
+            if seen.insert(ip1.clone()) {
+                hosts.push(ip1);
+            }
+            let ip2 = Ipv4Addr::new(
+                first_octet,
+                second_octet,
+                third_octet,
+                sampled_host_octet(first_octet, second_octet, third_octet, 1),
+            )
+            .to_string();
+            if seen.insert(ip2.clone()) {
+                hosts.push(ip2);
+            }
         }
     }
 
@@ -487,11 +500,9 @@ fn is_ipv4_range(value: &str) -> bool {
 }
 
 fn append_unique(targets: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
-    for value in values {
-        if !targets.iter().any(|existing| existing == &value) {
-            targets.push(value);
-        }
-    }
+    use std::collections::HashSet;
+    let existing: HashSet<String> = targets.iter().cloned().collect();
+    targets.extend(values.into_iter().filter(|v| !existing.contains(v)));
 }
 
 #[cfg(test)]

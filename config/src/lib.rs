@@ -773,11 +773,9 @@ fn read_host_entries(path: &Path) -> Result<HostEntries, ConfigError> {
 }
 
 fn append_unique(target: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
-    for value in values {
-        if !target.iter().any(|existing| existing == &value) {
-            target.push(value);
-        }
-    }
+    use std::collections::HashSet;
+    let existing: HashSet<String> = target.iter().cloned().collect();
+    target.extend(values.into_iter().filter(|v| !existing.contains(v)));
 }
 
 fn append_split_csv(target: &mut Vec<String>, value: &str) {

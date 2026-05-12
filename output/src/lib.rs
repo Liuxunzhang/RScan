@@ -7,6 +7,39 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+/// Static string constants for BTreeMap keys to avoid repeated allocations
+pub mod keys {
+    pub const PORT: &str = "port";
+    pub const SERVICE: &str = "service";
+    pub const TITLE: &str = "title";
+    pub const STATUS_CODE: &str = "status_code";
+    pub const BANNER: &str = "banner";
+    pub const VERSION: &str = "version";
+    pub const PRODUCT: &str = "product";
+    pub const OS: &str = "os";
+    pub const INFO: &str = "info";
+    pub const URL: &str = "Url";
+    pub const LENGTH: &str = "length";
+    pub const FINGERPRINTS: &str = "fingerprints";
+    pub const SERVER_INFO: &str = "server_info";
+    pub const REDIRECT_URL: &str = "redirect_Url";
+    pub const POC: &str = "poc";
+    pub const GROUP: &str = "group";
+    pub const VARIABLES: &str = "variables";
+    pub const PROTOCOL: &str = "protocol";
+    pub const PROCESS_NAME: &str = "process_name";
+    pub const PID: &str = "pid";
+    pub const OUTPUT_PATH: &str = "output_path";
+    pub const DOMAIN: &str = "domain";
+    pub const DOMAIN_CONTROLLERS: &str = "domain_controllers";
+    pub const HOSTNAME: &str = "hostname";
+    pub const USERNAME: &str = "username";
+    pub const ARCH: &str = "arch";
+    pub const HOME_DIR: &str = "home_dir";
+    pub const CURRENT_DIR: &str = "current_dir";
+    pub const SENSITIVE_FILES: &str = "sensitive_files";
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResultType {
     #[serde(rename = "HOST")]
