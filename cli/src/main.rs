@@ -83,32 +83,52 @@ fn main() -> Result<()> {
     if stdout_enabled {
         println!("{} scan started", elapsed_prefix(started.elapsed()));
     }
-    let report = app.run()?;
 
-    let total_results = report.results.len();
-    for (index, result) in report.results.iter().enumerate() {
-        output.write_result(result)?;
-        if stdout_enabled {
-            let progress = if config.output.show_progress && total_results > 0 {
-                format!("[{}/{}] ", index + 1, total_results)
+    // Progressive emission: findings are written to the output sink as stages
+    // produce them. Stdout prints immediately unless -pg is set, in which case
+    // lines are buffered so the classic [n/total] progress prefix can be applied
+    // once the full result count is known.
+    let stdout_enabled_flag = stdout_enabled;
+    let show_progress = config.output.show_progress;
+    let no_color = config.output.no_color;
+    let slow_log = config.output.slow_log_output;
+    let mut progress_buffer = Vec::new();
+    let report = app.run_with_emitter(|result| {
+        output.write_result(&result)?;
+        if stdout_enabled_flag {
+            if show_progress {
+                progress_buffer.push(result);
             } else {
-                String::new()
-            };
+                let line = format!(
+                    "{} {}",
+                    elapsed_prefix(started.elapsed()),
+                    format_result_line(&result)
+                );
+                println!("{}", colorize_line(&line, result.kind.as_str(), no_color));
+                if slow_log {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        Ok(())
+    })?;
+    output.flush()?;
+
+    if stdout_enabled_flag && show_progress {
+        let total = progress_buffer.len();
+        for (index, result) in progress_buffer.iter().enumerate() {
+            let progress = format!("[{}/{}] ", index + 1, total);
             let line = format!(
                 "{} {progress}{}",
                 elapsed_prefix(started.elapsed()),
                 format_result_line(result)
             );
-            println!(
-                "{}",
-                colorize_line(&line, result.kind.as_str(), config.output.no_color)
-            );
-            if config.output.slow_log_output {
+            println!("{}", colorize_line(&line, result.kind.as_str(), no_color));
+            if slow_log {
                 thread::sleep(Duration::from_millis(50));
             }
         }
     }
-    output.flush()?;
 
     if stdout_enabled {
         println!(

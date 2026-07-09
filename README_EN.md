@@ -44,6 +44,25 @@ Show full help:
 ./target/release/rscan -h
 ```
 
+## Development and Quality Checks
+
+Recommended pre-submit checks:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --no-fail-fast
+cargo build --release --workspace
+```
+
+If `just` is installed, the same gate is available as:
+
+```bash
+just check-all
+```
+
+The repository includes a GitHub Actions CI workflow for formatting, Clippy, tests, and release builds.
+
 ## Workspace Layout
 
 - `cli/`: CLI entrypoint

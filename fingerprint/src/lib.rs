@@ -1,17 +1,17 @@
 use anyhow::{Context, Result};
-use regex::bytes::{Captures, Regex, RegexBuilder};
 use regex::Regex as TextRegex;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use regex::bytes::{Captures, Regex, RegexBuilder};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
 #[cfg(test)]
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 #[cfg(test)]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(test)]
@@ -135,41 +135,36 @@ pub fn fingerprint_services(
         return Ok(Vec::new());
     }
 
-    let queue = Arc::new(Mutex::new(VecDeque::from(targets.to_vec())));
-    let matches = Arc::new(Mutex::new(Vec::new()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let next_index = AtomicUsize::new(0);
+    let total = targets.len();
     let worker_count = concurrency.max(1).min(targets.len());
 
-    thread::scope(|scope| {
+    let mut matches = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
-            let matches = Arc::clone(&matches);
-
-            scope.spawn(move || {
+            let next_index = &next_index;
+            workers.push(scope.spawn(move || {
+                let mut local = Vec::new();
                 loop {
-                    let next = {
-                        let mut queue = queue.lock().expect("queue lock poisoned");
-                        queue.pop_front()
-                    };
-                    let Some(target) = next else {
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= total {
                         break;
-                    };
-
-                    match fingerprint_target(&target, timeout) {
-                        Ok(Some(service)) => {
-                            matches.lock().expect("matches lock poisoned").push(service);
-                        }
-                        Ok(None) => {}
-                        Err(_) => {}
+                    }
+                    if let Ok(Some(service)) = fingerprint_target(&targets[index], timeout) {
+                        local.push(service)
                     }
                 }
-            });
+                local
+            }));
         }
-    });
 
-    let mut matches = Arc::try_unwrap(matches)
-        .expect("all workers should exit")
-        .into_inner()
-        .expect("matches lock poisoned");
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("fingerprint worker panicked"))
+            .collect::<Vec<_>>()
+    });
     matches.sort_by(|left, right| {
         left.host
             .cmp(&right.host)
@@ -240,12 +235,11 @@ fn fingerprint_target_with_transport(
         if let Some(result) = match_probe_response(target, probe, &response, database, &mut used) {
             return Ok(Some(result));
         }
-        if GO_DEFAULT_TCP_PROBES.contains(&probe.name.as_str()) {
-            if let Some(result) =
+        if GO_DEFAULT_TCP_PROBES.contains(&probe.name.as_str())
+            && let Some(result) =
                 match_mapped_probe_response(target, probe, &response, database, &mut used)
-            {
-                return Ok(Some(result));
-            }
+        {
+            return Ok(Some(result));
         }
     }
 
@@ -353,10 +347,10 @@ fn parse_probe_block(lines: &[String]) -> Result<Probe> {
             if let Ok(rule) = parse_match_rule(rule, false) {
                 probe.matches.push(rule);
             }
-        } else if let Some(rule) = line.strip_prefix("softmatch ") {
-            if let Ok(rule) = parse_match_rule(rule, true) {
-                probe.matches.push(rule);
-            }
+        } else if let Some(rule) = line.strip_prefix("softmatch ")
+            && let Ok(rule) = parse_match_rule(rule, true)
+        {
+            probe.matches.push(rule);
         }
     }
 
@@ -430,6 +424,8 @@ fn parse_port_ranges(spec: &str) -> Result<Vec<PortRange>> {
 
 fn parse_go_port_map() -> Result<HashMap<u16, Vec<String>>> {
     static NAME_RE: OnceLock<TextRegex> = OnceLock::new();
+    let name_re = NAME_RE
+        .get_or_init(|| TextRegex::new(r#""([^"]+)""#).expect("port map regex should compile"));
 
     let mut map = HashMap::new();
     let mut in_port_map = false;
@@ -450,8 +446,7 @@ fn parse_go_port_map() -> Result<HashMap<u16, Vec<String>>> {
             continue;
         };
         let port = port.trim().parse::<u16>()?;
-        let names = NAME_RE
-            .get_or_init(|| TextRegex::new(r#""([^"]+)""#).expect("port map regex should compile"))
+        let names = name_re
             .captures_iter(rest)
             .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()))
             .collect::<Vec<_>>();
@@ -828,7 +823,9 @@ fn match_probe_response(
         "GenericLines" => {
             if let Some(index) = database.probes_by_name.get("NULL").copied() {
                 used.insert("NULL".to_string());
-                if let Some(result) = match_probe(target, &database.probes[index], response, database) {
+                if let Some(result) =
+                    match_probe(target, &database.probes[index], response, database)
+                {
                     return Some(result);
                 }
             }
@@ -837,7 +834,8 @@ fn match_probe_response(
         _ => {
             if let Some(index) = database.probes_by_name.get("GenericLines").copied() {
                 used.insert("GenericLines".to_string());
-                if let Some(result) = match_probe(target, &database.probes[index], response, database)
+                if let Some(result) =
+                    match_probe(target, &database.probes[index], response, database)
                 {
                     return Some(result);
                 }
@@ -891,19 +889,19 @@ fn match_probe(
         }
     }
 
-    if let Some(fallback_name) = &probe.fallback {
-        if let Some(index) = database.probes_by_name.get(fallback_name).copied() {
-            for rule in &database.probes[index].matches {
-                let Some(captures) = rule.regex.captures(response) else {
-                    continue;
-                };
-                let result = build_match_result(target, rule, &captures, response);
-                if !rule.is_soft {
-                    return Some(result);
-                }
-                if soft_match.is_none() {
-                    soft_match = Some(result);
-                }
+    if let Some(fallback_name) = &probe.fallback
+        && let Some(index) = database.probes_by_name.get(fallback_name).copied()
+    {
+        for rule in &database.probes[index].matches {
+            let Some(captures) = rule.regex.captures(response) else {
+                continue;
+            };
+            let result = build_match_result(target, rule, &captures, response);
+            if !rule.is_soft {
+                return Some(result);
+            }
+            if soft_match.is_none() {
+                soft_match = Some(result);
             }
         }
     }
@@ -1106,8 +1104,8 @@ mod tests {
     use rustls::{ServerConfig, ServerConnection, StreamOwned};
     use std::io::{BufReader, ErrorKind};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     const TEST_TLS_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
@@ -1175,9 +1173,9 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                 )
                 .with_safe_default_protocol_versions()
                 .expect("TLS protocol versions should be available")
-                    .with_no_client_auth()
-                    .with_single_cert(certs, key)
-                    .expect("TLS server config should build"),
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .expect("TLS server config should build"),
             )
         }))
     }
@@ -1256,10 +1254,27 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
-                        if tls.conn.complete_io(&mut tls.sock).is_err() {
+                        let handshake_deadline = Instant::now() + Duration::from_secs(2);
+                        while tls.conn.is_handshaking() && Instant::now() < handshake_deadline {
+                            match tls.conn.complete_io(&mut tls.sock) {
+                                Ok(_) => {}
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        ErrorKind::WouldBlock
+                                            | ErrorKind::TimedOut
+                                            | ErrorKind::Interrupted
+                                    ) =>
+                                {
+                                    thread::sleep(Duration::from_millis(10));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if tls.conn.is_handshaking() {
                             continue;
                         }
                         tls.write_all(b"220 mail.example ESMTP ready\r\n")
@@ -1309,10 +1324,27 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                         stream
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .expect("write timeout should set");
-                        let conn =
-                            ServerConnection::new(config.clone()).expect("server conn should build");
+                        let conn = ServerConnection::new(config.clone())
+                            .expect("server conn should build");
                         let mut tls = StreamOwned::new(conn, stream);
-                        if tls.conn.complete_io(&mut tls.sock).is_err() {
+                        let handshake_deadline = Instant::now() + Duration::from_secs(2);
+                        while tls.conn.is_handshaking() && Instant::now() < handshake_deadline {
+                            match tls.conn.complete_io(&mut tls.sock) {
+                                Ok(_) => {}
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        ErrorKind::WouldBlock
+                                            | ErrorKind::TimedOut
+                                            | ErrorKind::Interrupted
+                                    ) =>
+                                {
+                                    thread::sleep(Duration::from_millis(10));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if tls.conn.is_handshaking() {
                             continue;
                         }
                         server_handshakes.fetch_add(1, Ordering::SeqCst);
@@ -1706,7 +1738,11 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
 
     #[test]
     fn reuses_plain_connection_across_initial_read_and_probes_like_go() {
-        let listener = TcpListener::bind("127.0.0.1:505").expect("listener should bind");
+        let listener = [5000_u16, 5400, 5432, 5555, 8000, 9000]
+            .into_iter()
+            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("listener should bind on a GenericLines/GetRequest port");
+        let port = listener.local_addr().expect("addr").port();
 
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("connection should arrive");
@@ -1739,7 +1775,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
         let matches = fingerprint_services(
             &[ServiceFingerprintTarget {
                 host: "127.0.0.1".to_string(),
-                port: 505,
+                port,
             }],
             Duration::from_secs(1),
             1,
@@ -1754,7 +1790,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
 
     #[test]
     fn passive_banner_check_does_not_skip_active_generic_lines_probe() {
-        let listener = [110_u16, 119, 214, 264, 449]
+        let listener = [5000_u16, 5400, 5432, 5555, 8000, 9000]
             .into_iter()
             .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
             .expect("listener should bind on a GenericLines port");
@@ -1774,7 +1810,9 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
                     Ok(count) => {
                         seen.extend_from_slice(&buf[..count]);
                         if seen.windows(4).any(|window| window == b"\r\n\r\n") {
-                            stream.write_all(b"ERROR\r\n").expect("probe reply should write");
+                            stream
+                                .write_all(b"ERROR\r\n")
+                                .expect("probe reply should write");
                             break;
                         }
                     }
@@ -1860,10 +1898,7 @@ zSzfRta6NR6ILTdj7W2rfKU=\n\
             .map(|index| database.probes[*index].name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            &names[..GO_DEFAULT_TCP_PROBES.len()],
-            GO_DEFAULT_TCP_PROBES
-        );
+        assert_eq!(&names[..GO_DEFAULT_TCP_PROBES.len()], GO_DEFAULT_TCP_PROBES);
     }
 
     #[test]

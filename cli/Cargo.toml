@@ -13,11 +13,11 @@ rscan-output = { path = "../output" }
 serde_json.workspace = true
 
 [dev-dependencies]
-hex = "0.4.3"
-russh = "0.60.1"
-rustls = "0.23.38"
-rustls-pemfile = "2.2.0"
-tokio = { version = "1.52.1", features = ["net", "rt-multi-thread", "time"] }
+hex.workspace = true
+russh.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time"] }
 
 [[bin]]
 name = "rscan"

@@ -8,21 +8,21 @@ publish.workspace = true
 [dependencies]
 aes = "0.8.4"
 anyhow.workspace = true
-base64 = "0.22.1"
+base64.workspace = true
 cbc = "0.1.2"
 des = "0.8.1"
-hex = "0.4.3"
+hex.workspace = true
 md5 = "0.7.0"
 oracle-rs = "0.1.7"
 rdp-rs = "0.1.0"
-reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "gzip", "rustls-tls"] }
-rustls = "0.23.38"
+reqwest = { workspace = true, features = ["blocking", "gzip", "rustls-tls"] }
+rustls.workspace = true
 serde_json.workspace = true
 sha1 = "0.10.6"
 smb2 = "0.7.2"
 ssh2 = "0.9.5"
-tokio = { version = "1.52.1", features = ["rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 
 [dev-dependencies]
-russh = "0.60.1"
-rustls-pemfile = "2.2.0"
+russh.workspace = true
+rustls-pemfile.workspace = true

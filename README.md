@@ -44,6 +44,25 @@ target/release/rscan
 ./target/release/rscan -h
 ```
 
+## 开发与质量检查
+
+提交前建议运行：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --no-fail-fast
+cargo build --release --workspace
+```
+
+如果安装了 `just`，也可以运行：
+
+```bash
+just check-all
+```
+
+仓库已提供 GitHub Actions CI，用于自动执行格式化、Clippy、测试和 release 构建检查。
+
 ## 仓库说明
 
 - `cli/`：命令行入口

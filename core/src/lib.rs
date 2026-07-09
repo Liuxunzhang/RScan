@@ -1,27 +1,34 @@
 use anyhow::Result;
-use rscan_config::{AppConfig, WebConfig};
-use rscan_fingerprint::{ServiceFingerprint, ServiceFingerprintTarget, fingerprint_services};
+use rscan_config::AppConfig;
+use rscan_fingerprint::{ServiceFingerprintTarget, fingerprint_services};
 use rscan_net::{expand_targets, parse_ports, probe_live_hosts, scan_tcp_ports};
 use rscan_output::{ResultType, ScanResult, keys};
-use rscan_platform::{collect_dc_info, collect_local_system_info, collect_minidump};
-use rscan_plugins::{
-    AuthRuntimeOptions, ConnectionRuntimeOptions, Ms17010RuntimeOptions, OpenService,
-    PluginContext, RedisRuntimeOptions, ServiceScanRuntimeOptions, scan_services, select_plugins,
-    set_auth_runtime_options, set_connection_runtime_options, set_ms17010_runtime_options,
-    set_redis_runtime_options, set_service_scan_runtime_options,
-};
-use rscan_poc::{
-    Poc, PocExecutionOptions, PocMatch, execute_pocs, filter_pocs, load_embedded_pocs,
-    load_pocs_from_path,
-};
-use rscan_web::{WebScanResult, WebScanner};
+use rscan_plugins::{scan_services, select_plugins};
+use rscan_poc::{PocExecutionOptions, filter_pocs, load_embedded_pocs, load_pocs_from_path};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fmt::{self, Display, Formatter};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::collections::BTreeMap;
 use std::time::Duration;
-use time::{OffsetDateTime, macros::format_description};
+mod pipeline;
+mod result_builders;
+mod summary;
+mod targets;
+pub(crate) use pipeline::target_count;
+use pipeline::{
+    build_plugin_context, build_service_runtime_bundle, execute_pocs_for_targets,
+    is_local_only_mode, plugin_result_type, scan_web_targets, selected_local_modules,
+};
+use result_builders::{
+    build_fingerprint_scan_result, build_local_results, build_web_scan_result, now_timestamp,
+    selected_web_modules,
+};
+pub use summary::{ExecutionReport, ScanSummary};
+use summary::{
+    enabled_disabled, liveness_mode, summarize_counted_items, summarize_items, top_alive_subnets,
+};
+use targets::{
+    append_unique_open_ports, build_service_targets, build_web_targets, count_unique_hosts,
+    exclude_hosts, exclude_ports, expand_direct_host_ports, parse_ports_or_empty,
+};
 
 #[derive(Debug, Clone)]
 pub struct Application {
@@ -77,6 +84,16 @@ impl Application {
     }
 
     pub fn run(&self) -> Result<ExecutionReport> {
+        self.run_with_emitter(|_| Ok(()))
+    }
+
+    /// Run the full scan pipeline, invoking `emit` for each finding as it is
+    /// produced (progressive emission). The returned report still contains the
+    /// complete result set for summary generation.
+    pub fn run_with_emitter<F>(&self, mut emit: F) -> Result<ExecutionReport>
+    where
+        F: FnMut(ScanResult) -> Result<()>,
+    {
         let mode = self.config.scan.mode.to_string();
         let local_modules = selected_local_modules(&mode, self.config.scan.local_mode);
         let local_only_mode = !local_modules.is_empty() && is_local_only_mode(&mode);
@@ -91,6 +108,14 @@ impl Application {
         let scan_ports = exclude_ports(ports, &excluded_ports);
         let mut results = Vec::new();
         let mut alive_hosts = Vec::new();
+
+        let push =
+            |result: ScanResult, results: &mut Vec<ScanResult>, emit: &mut F| -> Result<()> {
+                emit(result.clone())?;
+                results.push(result);
+                Ok(())
+            };
+
         let scan_hosts = if local_only_mode
             || scan_hosts.len() <= 1
             || self.config.scan.disable_ping
@@ -100,18 +125,27 @@ impl Application {
         } else {
             let liveness = probe_live_hosts(
                 &scan_hosts,
-                Duration::from_secs(self.config.scan.timeout_secs.min(3).max(1)),
+                Duration::from_secs(self.config.scan.timeout_secs.clamp(1, 3)),
                 usize::from(self.config.scan.threads),
                 self.config.scan.use_ping,
             )?;
             if liveness.attempted {
-                results.extend(liveness.alive_hosts.iter().map(|alive| ScanResult {
-                    time: now_timestamp(),
-                    kind: ResultType::Host,
-                    target: alive.host.clone(),
-                    status: "alive".to_string(),
-                    details: BTreeMap::from([(keys::PROTOCOL.to_string(), json!(alive.protocol))]),
-                }));
+                for alive in &liveness.alive_hosts {
+                    push(
+                        ScanResult {
+                            time: now_timestamp(),
+                            kind: ResultType::Host,
+                            target: alive.host.clone(),
+                            status: "alive".to_string(),
+                            details: BTreeMap::from([(
+                                keys::PROTOCOL.to_string(),
+                                json!(alive.protocol),
+                            )]),
+                        },
+                        &mut results,
+                        &mut emit,
+                    )?;
+                }
                 alive_hosts = liveness
                     .alive_hosts
                     .iter()
@@ -137,13 +171,19 @@ impl Application {
             )?
         };
         append_unique_open_ports(&mut open_ports, direct_open_ports);
-        results.extend(open_ports.iter().map(|open| ScanResult {
-            time: now_timestamp(),
-            kind: ResultType::Port,
-            target: open.host.clone(),
-            status: "open".to_string(),
-            details: BTreeMap::from([(keys::PORT.to_string(), json!(open.port))]),
-        }));
+        for open in &open_ports {
+            push(
+                ScanResult {
+                    time: now_timestamp(),
+                    kind: ResultType::Port,
+                    target: open.host.clone(),
+                    status: "open".to_string(),
+                    details: BTreeMap::from([(keys::PORT.to_string(), json!(open.port))]),
+                },
+                &mut results,
+                &mut emit,
+            )?;
+        }
         let fingerprint_results = if self.config.scan.enable_fingerprint && !open_ports.is_empty() {
             fingerprint_services(
                 &open_ports
@@ -159,11 +199,9 @@ impl Application {
         } else {
             Vec::new()
         };
-        results.extend(
-            fingerprint_results
-                .iter()
-                .map(build_fingerprint_scan_result),
-        );
+        for fp in &fingerprint_results {
+            push(build_fingerprint_scan_result(fp), &mut results, &mut emit)?;
+        }
         let service_plugin_defs = select_plugins(&mode);
         let service_targets = build_service_targets(
             &mode,
@@ -175,42 +213,28 @@ impl Application {
         let service_findings = if service_plugin_defs.is_empty() || service_targets.is_empty() {
             Vec::new()
         } else {
-            set_auth_runtime_options(AuthRuntimeOptions {
-                domain: self.config.auth.domain.clone(),
-                hashes: resolved.hashes.clone(),
-                disable_brute: self.config.scan.disable_brute,
-            });
-            set_redis_runtime_options(RedisRuntimeOptions {
-                redis_file: self.config.redis.redis_file.clone(),
-                redis_shell: self.config.redis.redis_shell.clone(),
-                disable_redis: self.config.redis.disable_redis,
-                redis_write_path: self.config.redis.redis_write_path.clone(),
-                redis_write_content: self.config.redis.redis_write_content.clone(),
-                redis_write_file: self.config.redis.redis_write_file.clone(),
-            });
-            set_ms17010_runtime_options(Ms17010RuntimeOptions {
-                shellcode: self.config.runtime.shellcode.clone(),
-            });
-            set_connection_runtime_options(ConnectionRuntimeOptions {
-                max_retries: self.config.scan.max_retries,
-            });
-            set_service_scan_runtime_options(ServiceScanRuntimeOptions {
-                module_threads: self.config.scan.module_threads,
-                global_timeout_secs: self.config.scan.global_timeout_secs,
-                log_errors: self.config.output.log_level.eq_ignore_ascii_case("debug"),
-            });
+            let runtime = build_service_runtime_bundle(&self.config, &resolved);
             scan_services(
                 &service_targets,
                 &mode,
-                &PluginContext {
-                    usernames: resolved.usernames.clone(),
-                    passwords: resolved.passwords.clone(),
-                    timeout_secs: self.config.scan.timeout_secs,
-                    ssh_key_path: self.config.auth.ssh_key_path.clone(),
-                },
+                &build_plugin_context(&self.config, &resolved),
+                &runtime,
             )?
         };
         let service_finding_count = service_findings.len();
+        for finding in service_findings {
+            push(
+                ScanResult {
+                    time: now_timestamp(),
+                    kind: plugin_result_type(&finding.plugin),
+                    target: finding.target.host,
+                    status: finding.status,
+                    details: finding.details,
+                },
+                &mut results,
+                &mut emit,
+            )?;
+        }
         let web_targets = if local_only_mode {
             Vec::new()
         } else {
@@ -222,19 +246,16 @@ impl Application {
             usize::from(self.config.scan.threads),
         );
         let web_result_count = web_results.len();
-        results.extend(service_findings.into_iter().map(|finding| ScanResult {
-            time: now_timestamp(),
-            kind: plugin_result_type(&finding.plugin),
-            target: finding.target.host,
-            status: finding.status,
-            details: finding.details,
-        }));
         let selected_plugin_count =
             service_plugin_defs.len() + local_modules.len() + selected_web_modules(&mode).len();
         let local_results = build_local_results(&local_modules)?;
         let local_result_count = local_results.len();
-        results.extend(local_results);
-        results.extend(web_results.iter().map(build_web_scan_result));
+        for result in local_results {
+            push(result, &mut results, &mut emit)?;
+        }
+        for web in &web_results {
+            push(build_web_scan_result(web), &mut results, &mut emit)?;
+        }
         let selected_pocs = self.selected_pocs()?;
         let poc_target_count = if selected_pocs.is_empty() {
             0
@@ -254,7 +275,7 @@ impl Application {
             execute_pocs_for_targets(&web_results, &selected_pocs, &options)?
         };
         let poc_match_count = poc_matches.len();
-        results.extend(poc_matches.into_iter().map(|poc| {
+        for poc in poc_matches {
             let mut details = BTreeMap::from([(keys::POC.to_string(), json!(poc.poc_name))]);
             if let Some(group) = poc.group.filter(|group| !group.is_empty()) {
                 details.insert(keys::GROUP.to_string(), json!(group));
@@ -262,14 +283,18 @@ impl Application {
             if !poc.variables.is_empty() {
                 details.insert(keys::VARIABLES.to_string(), json!(poc.variables));
             }
-            ScanResult {
-                time: now_timestamp(),
-                kind: ResultType::Vuln,
-                target: poc.target,
-                status: "vulnerable".to_string(),
-                details,
-            }
-        }));
+            push(
+                ScanResult {
+                    time: now_timestamp(),
+                    kind: ResultType::Vuln,
+                    target: poc.target,
+                    status: "vulnerable".to_string(),
+                    details,
+                },
+                &mut results,
+                &mut emit,
+            )?;
+        }
         let alive_subnets_16 = if candidate_host_count > 1000 {
             top_alive_subnets(&alive_hosts, 16, usize::from(self.config.scan.live_top))
         } else {
@@ -344,659 +369,64 @@ impl Application {
     }
 }
 
-fn build_local_results(modules: &[String]) -> Result<Vec<ScanResult>> {
-    let mut results = Vec::new();
-    for module in modules {
-        match module.as_str() {
-            "localinfo" => results.push(build_local_info_result()?),
-            "dcinfo" => {
-                if let Some(result) = build_dcinfo_result()? {
-                    results.push(result);
-                }
-            }
-            "minidump" => {
-                if let Some(result) = build_minidump_result()? {
-                    results.push(result);
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(results)
-}
-
-fn selected_web_modules(mode: &str) -> Vec<String> {
-    match mode.to_ascii_lowercase().as_str() {
-        "webtitle" => vec!["webtitle".to_string()],
-        "webpoc" => vec!["webpoc".to_string()],
-        _ => Vec::new(),
-    }
-}
-
-fn build_local_info_result() -> Result<ScanResult> {
-    let local = collect_local_system_info()?;
-    let mut details = BTreeMap::from([
-        (keys::HOSTNAME.to_string(), json!(local.hostname)),
-        (keys::USERNAME.to_string(), json!(local.username)),
-        (keys::OS.to_string(), json!(local.os)),
-        (keys::ARCH.to_string(), json!(local.arch)),
-    ]);
-    if let Some(home_dir) = local.home_dir {
-        details.insert(
-            keys::HOME_DIR.to_string(),
-            json!(home_dir.to_string_lossy().to_string()),
-        );
-    }
-    if let Some(current_dir) = local.current_dir {
-        details.insert(
-            keys::CURRENT_DIR.to_string(),
-            json!(current_dir.to_string_lossy().to_string()),
-        );
-    }
-    if !local.sensitive_files.is_empty() {
-        details.insert(
-            keys::SENSITIVE_FILES.to_string(),
-            json!(
-                local
-                    .sensitive_files
-                    .into_iter()
-                    .map(|path| path.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
-            ),
-        );
-    }
-    Ok(ScanResult {
-        time: now_timestamp(),
-        kind: ResultType::Service,
-        target: "localhost".to_string(),
-        status: "local-info".to_string(),
-        details,
-    })
-}
-
-fn build_minidump_result() -> Result<Option<ScanResult>> {
-    let Some(minidump) = collect_minidump()? else {
-        return Ok(None);
-    };
-
-    Ok(Some(ScanResult {
-        time: now_timestamp(),
-        kind: ResultType::Vuln,
-        target: "localhost".to_string(),
-        status: "minidump-created".to_string(),
-        details: BTreeMap::from([
-            (keys::SERVICE.to_string(), json!("minidump")),
-            (keys::PROCESS_NAME.to_string(), json!(minidump.process_name)),
-            (keys::PID.to_string(), json!(minidump.pid)),
-            (
-                keys::OUTPUT_PATH.to_string(),
-                json!(minidump.output_path.to_string_lossy().to_string()),
-            ),
-        ]),
-    }))
-}
-
-fn build_dcinfo_result() -> Result<Option<ScanResult>> {
-    let Some(dcinfo) = collect_dc_info()? else {
-        return Ok(None);
-    };
-
-    Ok(Some(ScanResult {
-        time: now_timestamp(),
-        kind: ResultType::Service,
-        target: "localhost".to_string(),
-        status: "dcinfo".to_string(),
-        details: BTreeMap::from([
-            (keys::SERVICE.to_string(), json!("dcinfo")),
-            (keys::DOMAIN.to_string(), json!(dcinfo.domain)),
-            (
-                keys::DOMAIN_CONTROLLERS.to_string(),
-                json!(dcinfo.domain_controllers),
-            ),
-        ]),
-    }))
-}
-
-fn is_local_only_mode(mode: &str) -> bool {
-    matches!(
-        mode.to_ascii_lowercase().as_str(),
-        "localinfo" | "dcinfo" | "minidump"
-    )
-}
-
-fn selected_local_modules(mode: &str, local_mode: bool) -> Vec<String> {
-    let mode = mode.to_ascii_lowercase();
-    if is_local_only_mode(&mode) {
-        vec![mode]
-    } else if local_mode {
-        vec!["localinfo".to_string()]
-    } else {
-        Vec::new()
-    }
-}
-
-fn target_count(config: &AppConfig) -> usize {
-    config.targets.defined_target_count()
-}
-
-fn expand_direct_host_ports(specs: &[String]) -> Result<Vec<OpenService>> {
-    let mut targets = Vec::new();
-
-    for spec in specs {
-        let Some((host_spec, port_spec)) = spec.split_once(':') else {
-            continue;
-        };
-        let port = port_spec.parse::<u16>()?;
-        for host in expand_targets(&[host_spec.to_string()])? {
-            if !targets
-                .iter()
-                .any(|existing: &OpenService| existing.host == host && existing.port == port)
-            {
-                targets.push(OpenService { host, port });
-            }
-        }
-    }
-
-    Ok(targets)
-}
-
-fn count_unique_hosts(open_ports: &[OpenService]) -> usize {
-    open_ports
-        .iter()
-        .map(|open| open.host.as_str())
-        .collect::<BTreeSet<_>>()
-        .len()
-}
-
-fn append_unique_open_ports(target: &mut Vec<rscan_net::OpenPort>, extras: Vec<OpenService>) {
-    for extra in extras {
-        if !target
-            .iter()
-            .any(|existing| existing.host == extra.host && existing.port == extra.port)
-        {
-            target.push(rscan_net::OpenPort {
-                host: extra.host,
-                port: extra.port,
-            });
-        }
-    }
-}
-
-fn liveness_mode(config: &AppConfig) -> &'static str {
-    if config.scan.disable_ping {
-        "disabled"
-    } else if config.scan.use_ping {
-        "ping"
-    } else {
-        "icmp"
-    }
-}
-
-fn summarize_items(items: &[String]) -> String {
-    if items.is_empty() {
-        "none".to_string()
-    } else {
-        items.join(", ")
-    }
-}
-
-fn summarize_counted_items(items: &[String]) -> String {
-    match items.len() {
-        0 => "0".to_string(),
-        1..=4 => format!("{} ({})", items.len(), items.join(", ")),
-        _ => format!("{} ({} ...)", items.len(), items[..4].join(", ")),
-    }
-}
-
-fn enabled_disabled(value: bool) -> &'static str {
-    if value { "enabled" } else { "disabled" }
-}
-
-fn top_alive_subnets(hosts: &[String], prefix: u8, top: usize) -> Vec<(String, usize)> {
-    let mut counts = BTreeMap::new();
-    for host in hosts {
-        let Some(subnet) = subnet_bucket(host, prefix) else {
-            continue;
-        };
-        *counts.entry(subnet).or_insert(0usize) += 1;
-    }
-
-    let mut ranked = counts.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    ranked.truncate(top);
-    ranked
-}
-
-fn subnet_bucket(host: &str, prefix: u8) -> Option<String> {
-    let octets = host.parse::<std::net::Ipv4Addr>().ok()?.octets();
-    match prefix {
-        16 => Some(format!("{}.{}.0.0/16", octets[0], octets[1])),
-        24 => Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2])),
-        _ => None,
-    }
-}
-
-fn format_alive_subnets(items: &[(String, usize)]) -> String {
-    items
-        .iter()
-        .map(|(subnet, count)| format!("{subnet}={count}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionReport {
-    pub summary: ScanSummary,
-    pub results: Vec<ScanResult>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanSummary {
-    pub mode: String,
-    pub target_count: usize,
-    pub host_result_count: usize,
-    pub username_count: usize,
-    pub password_count: usize,
-    pub output_enabled: bool,
-    pub threads: u16,
-    pub timeout_secs: u64,
-    pub port_count: usize,
-    pub expanded_host_count: usize,
-    pub excluded_host_count: usize,
-    pub excluded_port_count: usize,
-    pub open_port_count: usize,
-    pub web_target_count: usize,
-    pub web_result_count: usize,
-    pub selected_plugin_count: usize,
-    pub service_finding_count: usize,
-    pub local_result_count: usize,
-    pub poc_target_count: usize,
-    pub selected_poc_count: usize,
-    pub poc_match_count: usize,
-    pub alive_subnets_16: Vec<(String, usize)>,
-    pub alive_subnets_24: Vec<(String, usize)>,
-}
-
-impl Display for ScanSummary {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
-            "scan summary\n  mode: {}\n  scope: targets={}, hosts={}, ports={}\n  filters: excluded_hosts={}, excluded_ports={}\n  findings: alive_hosts={}, open_ports={}, module_findings={}, web_results={}, poc_matches={}, local_results={}\n  modules: selected_plugins={}\n  web: targets={}, identified={}\n  pocs: targets={}, selected={}, matches={}\n  auth: users={}, passwords={}\n  runtime: threads={}, timeout={}s\n  output: {}",
-            self.mode,
-            self.target_count,
-            self.expanded_host_count,
-            self.port_count,
-            self.excluded_host_count,
-            self.excluded_port_count,
-            self.host_result_count,
-            self.open_port_count,
-            self.service_finding_count,
-            self.web_result_count,
-            self.poc_match_count,
-            self.local_result_count,
-            self.selected_plugin_count,
-            self.web_target_count,
-            self.web_result_count,
-            self.poc_target_count,
-            self.selected_poc_count,
-            self.poc_match_count,
-            self.username_count,
-            self.password_count,
-            self.threads,
-            self.timeout_secs,
-            if self.output_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        )?;
-        if !self.alive_subnets_16.is_empty() {
-            write!(
-                f,
-                "\n  alive_top_16: {}",
-                format_alive_subnets(&self.alive_subnets_16)
-            )?;
-        }
-        if !self.alive_subnets_24.is_empty() {
-            write!(
-                f,
-                "\n  alive_top_24: {}",
-                format_alive_subnets(&self.alive_subnets_24)
-            )?;
-        }
-        Ok(())
-    }
-}
-
-fn plugin_result_type(plugin: &str) -> ResultType {
-    match plugin {
-        "findnet" | "netbios" => ResultType::Service,
-        _ => ResultType::Vuln,
-    }
-}
-
-fn parse_ports_or_empty(spec: &str) -> Result<Vec<u16>> {
-    if spec.trim().is_empty() {
-        Ok(Vec::new())
-    } else {
-        parse_ports(spec)
-    }
-}
-
-fn scan_web_targets(
-    targets: &[String],
-    config: &WebConfig,
-    concurrency: usize,
-) -> Vec<WebScanResult> {
-    if targets.is_empty() {
-        return Vec::new();
-    }
-
-    let Ok(scanner) = WebScanner::new(config) else {
-        return Vec::new();
-    };
-    let worker_count = concurrency.max(1).min(targets.len());
-    let queue = Arc::new(Mutex::new(VecDeque::from(
-        targets.iter().cloned().enumerate().collect::<Vec<_>>(),
-    )));
-    let results = Arc::new(Mutex::new(Vec::new()));
-
-    thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
-            let results = Arc::clone(&results);
-            let scanner = scanner.clone();
-
-            scope.spawn(move || {
-                loop {
-                    let next = {
-                        let mut queue = queue.lock().expect("web target queue lock poisoned");
-                        queue.pop_front()
-                    };
-                    let Some((index, target)) = next else {
-                        break;
-                    };
-
-                    if let Ok(result) = scanner.scan_target(&target) {
-                        results
-                            .lock()
-                            .expect("web results lock poisoned")
-                            .push((index, result));
-                    }
-                }
-            });
-        }
-    });
-
-    let mut results = Arc::try_unwrap(results)
-        .expect("all web workers should exit")
-        .into_inner()
-        .expect("web results lock poisoned");
-    results.sort_by_key(|(index, _)| *index);
-    results.into_iter().map(|(_, result)| result).collect()
-}
-
-fn execute_pocs_for_targets(
-    targets: &[WebScanResult],
-    pocs: &[Poc],
-    options: &PocExecutionOptions,
-) -> Result<Vec<PocMatch>> {
-    if targets.is_empty() || pocs.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let total_workers = options.workers.max(1);
-    let target_workers = total_workers.min(targets.len());
-    let per_target_workers = (total_workers / target_workers).max(1);
-    let queue = Arc::new(Mutex::new(VecDeque::from(
-        targets
-            .iter()
-            .map(|target| target.final_url.clone())
-            .enumerate()
-            .collect::<Vec<_>>(),
-    )));
-    let matches = Arc::new(Mutex::new(Vec::new()));
-    let errors = Arc::new(Mutex::new(Vec::new()));
-
-    thread::scope(|scope| {
-        for _ in 0..target_workers {
-            let queue = Arc::clone(&queue);
-            let matches = Arc::clone(&matches);
-            let errors = Arc::clone(&errors);
-            let mut options = options.clone();
-            options.workers = per_target_workers;
-
-            scope.spawn(move || {
-                loop {
-                    let next = {
-                        let mut queue = queue.lock().expect("POC target queue lock poisoned");
-                        queue.pop_front()
-                    };
-                    let Some((index, target)) = next else {
-                        break;
-                    };
-
-                    match execute_pocs(&target, pocs, &options) {
-                        Ok(target_matches) => matches
-                            .lock()
-                            .expect("POC matches lock poisoned")
-                            .push((index, target_matches)),
-                        Err(error) => errors.lock().expect("POC errors lock poisoned").push(error),
-                    }
-                }
-            });
-        }
-    });
-
-    let errors = Arc::try_unwrap(errors)
-        .expect("all POC workers should exit")
-        .into_inner()
-        .expect("POC errors lock poisoned");
-    if let Some(error) = errors.into_iter().next() {
-        return Err(error);
-    }
-
-    let mut matches = Arc::try_unwrap(matches)
-        .expect("all POC workers should exit")
-        .into_inner()
-        .expect("POC matches lock poisoned");
-    matches.sort_by_key(|(index, _)| *index);
-    Ok(matches
-        .into_iter()
-        .flat_map(|(_, target_matches)| target_matches)
-        .collect())
-}
-
-fn exclude_hosts(hosts: Vec<String>, excluded_hosts: &[String]) -> Vec<String> {
-    if excluded_hosts.is_empty() {
-        return hosts;
-    }
-
-    let excluded = excluded_hosts.iter().collect::<BTreeSet<_>>();
-    hosts
-        .into_iter()
-        .filter(|host| !excluded.contains(host))
-        .collect()
-}
-
-fn exclude_ports(ports: Vec<u16>, excluded_ports: &[u16]) -> Vec<u16> {
-    if excluded_ports.is_empty() {
-        return ports;
-    }
-
-    let excluded = excluded_ports.iter().copied().collect::<BTreeSet<_>>();
-    ports
-        .into_iter()
-        .filter(|port| !excluded.contains(port))
-        .collect()
-}
-
-fn build_web_targets(
-    explicit_urls: &[String],
-    open_ports: &[rscan_net::OpenPort],
-) -> Result<Vec<String>> {
-    let web_ports = parse_ports("web")?.into_iter().collect::<BTreeSet<_>>();
-    let mut seen = BTreeSet::new();
-    let mut targets = Vec::new();
-
-    for url in explicit_urls {
-        if seen.insert(url.clone()) {
-            targets.push(url.clone());
-        }
-    }
-
-    for open in open_ports {
-        if web_ports.contains(&open.port) {
-            let target = format!("{}:{}", open.host, open.port);
-            if seen.insert(target.clone()) {
-                targets.push(target);
-            }
-        }
-    }
-
-    Ok(targets)
-}
-
-fn build_service_targets(
-    mode: &str,
-    _plugin_defs: &[rscan_plugins::PluginDefinition],
-    scan_hosts: &[String],
-    scan_ports: &[u16],
-    open_ports: &[rscan_net::OpenPort],
-) -> Vec<OpenService> {
-    let mut seen = BTreeSet::new();
-    let mut targets = Vec::new();
-
-    for open in open_ports {
-        let key = (open.host.clone(), open.port);
-        if seen.insert(key.clone()) {
-            targets.push(OpenService {
-                host: key.0,
-                port: key.1,
-            });
-        }
-    }
-
-    if mode.eq_ignore_ascii_case("all") {
-        return targets;
-    }
-
-    for host in scan_hosts {
-        for port in scan_ports {
-            let key = (host.clone(), *port);
-            if seen.insert(key.clone()) {
-                targets.push(OpenService {
-                    host: key.0,
-                    port: key.1,
-                });
-            }
-        }
-    }
-
-    targets
-}
-
-fn now_timestamp() -> String {
-    let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
-    now.format(&format)
-        .unwrap_or_else(|_| "1970-01-01 00:00:00".to_string())
-}
-
-fn build_fingerprint_scan_result(service: &ServiceFingerprint) -> ScanResult {
-    let mut details = BTreeMap::from([
-        (keys::PORT.to_string(), json!(service.port)),
-        (keys::SERVICE.to_string(), json!(service.service.clone())),
-    ]);
-    if !service.banner.is_empty() {
-        details.insert(keys::BANNER.to_string(), json!(service.banner.clone()));
-    }
-    if let Some(version) = &service.version {
-        details.insert(keys::VERSION.to_string(), json!(version));
-    }
-    for (key, value) in &service.extras {
-        match key.as_str() {
-            "vendor_product" => {
-                details.insert(keys::PRODUCT.to_string(), json!(value));
-            }
-            "os" => {
-                details.insert(keys::OS.to_string(), json!(value));
-            }
-            "info" => {
-                details.insert(keys::INFO.to_string(), json!(value));
-            }
-            _ => {}
-        }
-    }
-    ScanResult {
-        time: now_timestamp(),
-        kind: ResultType::Service,
-        target: service.host.clone(),
-        status: "identified".to_string(),
-        details,
-    }
-}
-
-fn build_web_scan_result(web: &WebScanResult) -> ScanResult {
-    let mut server_info = BTreeMap::from([
-        (keys::TITLE.to_string(), json!(web.title.clone())),
-        (keys::LENGTH.to_string(), json!(web.length.clone())),
-        (keys::STATUS_CODE.to_string(), json!(web.status_code)),
-    ]);
-    if web.requested_url != web.final_url {
-        server_info.insert(keys::REDIRECT_URL.to_string(), json!(web.final_url.clone()));
-    }
-    for (key, value) in &web.headers {
-        server_info.insert(key.to_lowercase(), json!(value));
-    }
-
-    let mut details = BTreeMap::from([
-        (keys::SERVICE.to_string(), json!("http")),
-        (keys::TITLE.to_string(), json!(web.title.clone())),
-        (keys::URL.to_string(), json!(web.final_url.clone())),
-        (keys::STATUS_CODE.to_string(), json!(web.status_code)),
-        (keys::LENGTH.to_string(), json!(web.length.clone())),
-        (keys::SERVER_INFO.to_string(), json!(server_info)),
-        (keys::FINGERPRINTS.to_string(), json!(web.fingerprints.clone())),
-    ]);
-    if let Some(port) = web_result_port(&web.final_url) {
-        details.insert(keys::PORT.to_string(), json!(port));
-    }
-
-    ScanResult {
-        time: now_timestamp(),
-        kind: ResultType::Service,
-        target: web.final_url.clone(),
-        status: "identified".to_string(),
-        details,
-    }
-}
-
-fn web_result_port(url: &str) -> Option<String> {
-    let (scheme, remainder) = url.split_once("://")?;
-    let authority = remainder.split('/').next().unwrap_or(remainder);
-    if authority.is_empty() {
-        return None;
-    }
-
-    if let Some(port) = authority.rsplit(':').next()
-        && authority.contains(':')
-        && port.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return Some(port.to_string());
-    }
-
-    match scheme {
-        "http" => Some("80".to_string()),
-        "https" => Some("443".to_string()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rscan_fingerprint::ServiceFingerprint;
+    use rscan_web::WebScanResult;
     use std::net::{TcpListener, UdpSocket};
+
+    #[test]
+    fn emits_results_progressively_during_port_scan() {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_emit = Arc::clone(&seen);
+        let report = Application::new(
+            AppConfig::from_tokens([
+                "-h",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-np",
+                "-silent",
+                "-no",
+            ])
+            .expect("config should parse"),
+        )
+        .run_with_emitter(|result| {
+            seen_for_emit
+                .lock()
+                .expect("seen lock")
+                .push(result.kind.as_str().to_string());
+            Ok(())
+        })
+        .expect("scan should succeed");
+
+        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{port}"));
+        let _ = server.join();
+
+        let emitted = seen.lock().expect("seen lock").clone();
+        assert!(
+            emitted.iter().any(|kind| kind == "PORT"),
+            "expected progressive PORT emission, got {emitted:?}; report={:?}",
+            report.results
+        );
+        assert!(
+            report
+                .results
+                .iter()
+                .any(|result| result.kind == ResultType::Port),
+            "report should still contain port results"
+        );
+    }
 
     #[test]
     fn executes_discovery_scan_and_applies_exclusions() {

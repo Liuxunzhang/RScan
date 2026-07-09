@@ -1,16 +1,17 @@
 use anyhow::{Result, anyhow};
-use std::collections::{BTreeSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::process::Command;
+use std::collections::BTreeSet;
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-const SERVICE_PORTS: &str = "21,22,23,25,110,135,139,143,162,389,445,465,502,587,636,873,993,995,1433,1521,2222,3306,3389,5020,5432,5672,5671,6379,8161,8443,9000,9092,9093,9200,10051,11211,15672,15671,27017,61616,61613";
-const DB_PORTS: &str = "1433,1521,3306,5432,5672,6379,7687,9042,9093,9200,11211,27017,61616";
-const WEB_PORTS: &str = "80,81,82,83,84,85,86,87,88,89,90,91,92,98,99,443,800,801,808,880,888,889,1000,1010,1080,1081,1082,1099,1118,1888,2008,2020,2100,2375,2379,3000,3008,3128,3505,5555,6080,6648,6868,7000,7001,7002,7003,7004,7005,7007,7008,7070,7071,7074,7078,7080,7088,7200,7680,7687,7688,7777,7890,8000,8001,8002,8003,8004,8005,8006,8008,8009,8010,8011,8012,8016,8018,8020,8028,8030,8038,8042,8044,8046,8048,8053,8060,8069,8070,8080,8081,8082,8083,8084,8085,8086,8087,8088,8089,8090,8091,8092,8093,8094,8095,8096,8097,8098,8099,8100,8101,8108,8118,8161,8172,8180,8181,8200,8222,8244,8258,8280,8288,8300,8360,8443,8448,8484,8800,8834,8838,8848,8858,8868,8879,8880,8881,8888,8899,8983,8989,9000,9001,9002,9008,9010,9043,9060,9080,9081,9082,9083,9084,9085,9086,9087,9088,9089,9090,9091,9092,9093,9094,9095,9096,9097,9098,9099,9100,9200,9443,9448,9800,9981,9986,9988,9998,9999,10000,10001,10002,10004,10008,10010,10051,10250,12018,12443,14000,15672,15671,16080,18000,18001,18002,18004,18008,18080,18082,18088,18090,18098,19001,20000,20720,20880,21000,21501,21502,28018";
-const MAIN_PORTS: &str = "21,22,23,80,81,110,135,139,143,389,443,445,502,873,993,995,1433,1521,3306,5432,5672,6379,7001,7687,8000,8005,8009,8080,8089,8443,9000,9042,9092,9200,10051,11211,15672,27017,61616";
+mod port_groups;
+mod ports;
+mod targets;
+
+use port_groups::LIVENESS_TCP_PORTS;
+pub use ports::parse_ports;
+pub use targets::expand_targets;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenPort {
@@ -30,71 +31,50 @@ pub struct AliveHostProbe {
     pub alive_hosts: Vec<AliveHost>,
 }
 
-pub fn parse_ports(spec: &str) -> Result<Vec<u16>> {
-    let mut ports = BTreeSet::new();
+/// Common TCP ports used as a liveness signal when ICMP is unavailable.
 
-    for item in spec
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-    {
-        if let Some(group) = named_port_group(item) {
-            for port in parse_ports(group)? {
-                ports.insert(port);
-            }
-            continue;
-        }
+#[derive(Debug, Clone)]
+struct ResolvedHost {
+    host: String,
+    addrs: Vec<IpAddr>,
+}
 
-        if let Some((start, end)) = item.split_once('-') {
-            let start = start
-                .parse::<u16>()
-                .map_err(|_| anyhow!("invalid port range start: {item}"))?;
-            let end = end
-                .parse::<u16>()
-                .map_err(|_| anyhow!("invalid port range end: {item}"))?;
-            let (from, to) = if start <= end {
-                (start, end)
-            } else {
-                (end, start)
-            };
-
-            for port in from..=to {
-                if port != 0 {
-                    ports.insert(port);
-                }
-            }
+/// Pre-resolve hosts once so the connect hot path never calls DNS per port.
+fn resolve_hosts(hosts: &[String]) -> Result<Vec<ResolvedHost>> {
+    let mut resolved = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+            vec![ip]
         } else {
-            let port = item
-                .parse::<u16>()
-                .map_err(|_| anyhow!("invalid port: {item}"))?;
-            if port != 0 {
-                ports.insert(port);
-            }
+            // Resolve with a dummy port; only the IP list is retained.
+            let probe = format!("{host}:0");
+            probe
+                .to_socket_addrs()
+                .map_err(|error| anyhow!("failed to resolve {host}: {error}"))?
+                .map(|socket| socket.ip())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        if addrs.is_empty() {
+            return Err(anyhow!("failed to resolve {host}: no addresses"));
+        }
+        resolved.push(ResolvedHost {
+            host: host.clone(),
+            addrs,
+        });
+    }
+    Ok(resolved)
+}
+
+fn try_connect_resolved(addrs: &[IpAddr], port: u16, timeout: Duration) -> bool {
+    for ip in addrs {
+        let addr = SocketAddr::new(*ip, port);
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return true;
         }
     }
-
-    Ok(ports.into_iter().collect())
-}
-
-fn named_port_group(value: &str) -> Option<&'static str> {
-    match value {
-        "service" => Some(SERVICE_PORTS),
-        "db" => Some(DB_PORTS),
-        "web" => Some(WEB_PORTS),
-        "all" => Some("1-65535"),
-        "main" => Some(MAIN_PORTS),
-        _ => None,
-    }
-}
-
-pub fn expand_targets(specs: &[String]) -> Result<Vec<String>> {
-    let mut targets = Vec::new();
-
-    for spec in specs {
-        append_expanded_target(&mut targets, spec)?;
-    }
-
-    Ok(targets)
+    false
 }
 
 pub fn scan_tcp_ports(
@@ -107,58 +87,42 @@ pub fn scan_tcp_ports(
         return Ok(Vec::new());
     }
 
-    let total_tasks = hosts.len().saturating_mul(ports.len());
+    let resolved = resolve_hosts(hosts)?;
+    let total_tasks = resolved.len().saturating_mul(ports.len());
     let next_index = AtomicUsize::new(0);
-    let open_ports = Arc::new(Mutex::new(Vec::new()));
-    let errors = Arc::new(Mutex::new(Vec::new()));
     let worker_count = concurrency.max(1).min(total_tasks);
 
-    thread::scope(|scope| {
+    let mut open_ports = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let next_index = &next_index;
-            let open_ports = Arc::clone(&open_ports);
-            let errors = Arc::clone(&errors);
-
-            scope.spawn(move || {
+            let resolved = &resolved;
+            workers.push(scope.spawn(move || {
+                let mut local = Vec::new();
                 loop {
                     let index = next_index.fetch_add(1, Ordering::Relaxed);
                     if index >= total_tasks {
                         break;
                     }
 
-                    let host = &hosts[index / ports.len()];
+                    let host = &resolved[index / ports.len()];
                     let port = ports[index % ports.len()];
-
-                    match try_connect(host, port, timeout) {
-                        Ok(true) => {
-                            open_ports
-                                .lock()
-                                .expect("open port lock poisoned")
-                                .push(OpenPort {
-                                    host: host.clone(),
-                                    port,
-                                })
-                        }
-                        Ok(false) => {}
-                        Err(error) => errors.lock().expect("error lock poisoned").push(error),
+                    if try_connect_resolved(&host.addrs, port, timeout) {
+                        local.push(OpenPort {
+                            host: host.host.clone(),
+                            port,
+                        });
                     }
                 }
-            });
+                local
+            }));
         }
+
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("TCP scan worker panicked"))
+            .collect::<Vec<_>>()
     });
-
-    let errors = Arc::try_unwrap(errors)
-        .expect("all workers should exit")
-        .into_inner()
-        .expect("error lock poisoned");
-    if let Some(error) = errors.into_iter().next() {
-        return Err(error);
-    }
-
-    let mut open_ports = Arc::try_unwrap(open_ports)
-        .expect("all workers should exit")
-        .into_inner()
-        .expect("open port lock poisoned");
     open_ports.sort_by(|left, right| {
         left.host
             .cmp(&right.host)
@@ -167,6 +131,11 @@ pub fn scan_tcp_ports(
     Ok(open_ports)
 }
 
+/// Primary liveness path: TCP connect probes against common ports (no external
+/// `ping` process). Hosts that accept a connection on any probe port are alive.
+/// When `use_ping_label` is true the reported protocol stays `"PING"` for
+/// fscan-compatible labeling; otherwise `"ICMP"` (historical label even though
+/// the primary probe is TCP connect / connection-refused based).
 pub fn probe_live_hosts(
     hosts: &[String],
     timeout: Duration,
@@ -180,334 +149,110 @@ pub fn probe_live_hosts(
         });
     }
 
-    let queue = Arc::new(Mutex::new(VecDeque::from(hosts.to_vec())));
-    let alive_hosts = Arc::new(Mutex::new(Vec::new()));
-    let attempted = Arc::new(Mutex::new(false));
-    let command_missing = Arc::new(Mutex::new(false));
-    let worker_count = concurrency.max(1).min(hosts.len()).min(50);
-    let protocol = if use_ping_label { "PING" } else { "ICMP" };
-
-    thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
-            let alive_hosts = Arc::clone(&alive_hosts);
-            let attempted = Arc::clone(&attempted);
-            let command_missing = Arc::clone(&command_missing);
-
-            scope.spawn(move || {
-                loop {
-                    if *command_missing
-                        .lock()
-                        .expect("command missing lock poisoned")
-                    {
-                        break;
-                    }
-
-                    let next = {
-                        let mut queue = queue.lock().expect("queue lock poisoned");
-                        queue.pop_front()
-                    };
-                    let Some(host) = next else {
-                        break;
-                    };
-
-                    match ping_host(&host, timeout) {
-                        Ok(alive) => {
-                            *attempted.lock().expect("attempted lock poisoned") = true;
-                            if alive {
-                                alive_hosts
-                                    .lock()
-                                    .expect("alive host lock poisoned")
-                                    .push(AliveHost { host, protocol });
-                            }
-                        }
-                        Err(PingError::CommandUnavailable) => {
-                            *command_missing
-                                .lock()
-                                .expect("command missing lock poisoned") = true;
-                            break;
-                        }
-                    }
-                }
+    let resolved = match resolve_hosts(hosts) {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            // Resolution failure: still report attempted=false so callers fall
+            // back to scanning the full host list (same as historical behavior
+            // when ping was unavailable).
+            return Ok(AliveHostProbe {
+                attempted: false,
+                alive_hosts: Vec::new(),
             });
         }
-    });
+    };
 
-    let attempted = *attempted.lock().expect("attempted lock poisoned");
-    let command_missing = *command_missing
-        .lock()
-        .expect("command missing lock poisoned");
-    let mut alive_hosts = Arc::try_unwrap(alive_hosts)
-        .expect("all workers should exit")
-        .into_inner()
-        .expect("alive host lock poisoned");
+    let next_index = AtomicUsize::new(0);
+    let total = resolved.len();
+    let worker_count = concurrency.max(1).min(total).min(50);
+    let protocol = if use_ping_label { "PING" } else { "ICMP" };
+
+    let mut alive_hosts = thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let next_index = &next_index;
+            let resolved = &resolved;
+            workers.push(scope.spawn(move || {
+                let mut local = Vec::new();
+                loop {
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= total {
+                        break;
+                    }
+                    let host = &resolved[index];
+                    if host_is_alive_tcp(&host.addrs, timeout) {
+                        local.push(AliveHost {
+                            host: host.host.clone(),
+                            protocol,
+                        });
+                    }
+                }
+                local
+            }));
+        }
+
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("liveness worker panicked"))
+            .collect::<Vec<_>>()
+    });
     alive_hosts.sort_by(|left, right| left.host.cmp(&right.host));
     alive_hosts.dedup_by(|left, right| left.host == right.host);
     Ok(AliveHostProbe {
-        attempted: attempted && !command_missing,
+        attempted: true,
         alive_hosts,
     })
 }
 
-fn try_connect(host: &str, port: u16, timeout: Duration) -> Result<bool> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let addr = SocketAddr::new(ip, port);
-        return Ok(TcpStream::connect_timeout(&addr, timeout).is_ok());
-    }
+fn host_is_alive_tcp(addrs: &[IpAddr], timeout: Duration) -> bool {
+    // Short per-port budget so multi-port liveness stays cheap.
+    let per_port = timeout
+        .checked_div(LIVENESS_TCP_PORTS.len() as u32)
+        .unwrap_or(timeout)
+        .max(Duration::from_millis(50))
+        .min(timeout);
 
-    let addr = format!("{host}:{port}");
-    let socket_addrs = addr
-        .to_socket_addrs()
-        .map_err(|error| anyhow!("failed to resolve {addr}: {error}"))?;
-
-    for socket_addr in socket_addrs {
-        if TcpStream::connect_timeout(&socket_addr, timeout).is_ok() {
-            return Ok(true);
+    for &port in LIVENESS_TCP_PORTS {
+        if try_connect_resolved(addrs, port, per_port) {
+            return true;
         }
     }
 
-    Ok(false)
+    // Final check: any TCP listener on a high-chance port already covered;
+    // also treat successful ICMP-less hosts with open ephemeral listeners
+    // via a zero-cost loopback-style connect attempt is not needed.
+    // If the host rejects all probes with RST quickly, try_connect returns
+    // false for closed ports — but for 127.0.0.1 tests we also accept a
+    // connect to an ephemeral "is host reachable" via port 0 which is invalid.
+    // Instead: consider host alive if ANY connect returns a definitive TCP
+    // answer (open OR refused) rather than timeout/unreachable.
+    host_is_reachable_tcp(addrs, per_port)
 }
 
-#[derive(Debug)]
-enum PingError {
-    CommandUnavailable,
-}
-
-fn ping_host(host: &str, timeout: Duration) -> std::result::Result<bool, PingError> {
-    let timeout_secs = timeout.as_secs().max(1).min(u64::from(u32::MAX));
-    let mut command = Command::new("ping");
-    if cfg!(target_os = "windows") {
-        command.args([
-            "-n",
-            "1",
-            "-w",
-            &timeout_secs.saturating_mul(1000).to_string(),
-            host,
-        ]);
-    } else if cfg!(target_os = "macos") {
-        command.args(["-c", "1", "-W", &timeout_secs.to_string(), host]);
-    } else {
-        command.args(["-c", "1", "-w", &timeout_secs.to_string(), host]);
-    }
-
-    match command.output() {
-        Ok(output) => Ok(output.status.success()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(PingError::CommandUnavailable)
-        }
-        Err(_) => Ok(false),
-    }
-}
-
-fn append_expanded_target(targets: &mut Vec<String>, spec: &str) -> Result<()> {
-    if spec.is_empty() {
-        return Ok(());
-    }
-
-    for item in spec
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-    {
-        if let Some(alias) = expand_alias(item) {
-            append_expanded_target(targets, alias)?;
-            continue;
-        }
-
-        if item.contains('/') {
-            append_unique(targets, expand_cidr(item)?);
-            continue;
-        }
-
-        if item.contains('-') && is_ipv4_range(item) {
-            append_unique(targets, expand_range(item)?);
-            continue;
-        }
-
-        if item.parse::<Ipv4Addr>().is_ok() || looks_like_hostname(item) {
-            append_unique(targets, [item.to_string()]);
-            continue;
-        }
-
-        return Err(anyhow!("unsupported target spec: {item}"));
-    }
-
-    Ok(())
-}
-
-fn expand_alias(value: &str) -> Option<&'static str> {
-    match value {
-        "10" => Some("10.0.0.0/8"),
-        "172" => Some("172.16.0.0/12"),
-        "192" => Some("192.168.0.0/16"),
-        _ => None,
-    }
-}
-
-fn expand_cidr(cidr: &str) -> Result<Vec<String>> {
-    let (ip, prefix) = cidr
-        .split_once('/')
-        .ok_or_else(|| anyhow!("invalid cidr: {cidr}"))?;
-    let base_ip = ip
-        .parse::<Ipv4Addr>()
-        .map_err(|_| anyhow!("invalid cidr ip: {cidr}"))?;
-    let prefix = prefix
-        .parse::<u8>()
-        .map_err(|_| anyhow!("invalid cidr prefix: {cidr}"))?;
-
-    if prefix > 32 {
-        return Err(anyhow!("invalid cidr prefix: {cidr}"));
-    }
-
-    if prefix == 8 {
-        return Ok(sample_subnet8(base_ip));
-    }
-
-    let host_bits = 32 - prefix as u32;
-    let max_hosts = 1u64 << host_bits;
-    if max_hosts > 1_048_576 {
-        return Err(anyhow!("cidr too large to expand safely: {cidr}"));
-    }
-
-    let base = u32::from(base_ip) & (!0u32 << host_bits);
-    let count = 1u32 << host_bits;
-    let mut hosts = Vec::with_capacity(count as usize);
-    for offset in 0..count {
-        hosts.push(Ipv4Addr::from(base + offset).to_string());
-    }
-    Ok(hosts)
-}
-
-fn sample_subnet8(base_ip: Ipv4Addr) -> Vec<String> {
-    use std::collections::HashSet;
-    let first_octet = base_ip.octets()[0];
-    let mut seen = HashSet::with_capacity(674);
-    let mut hosts = Vec::with_capacity(674);
-    let common_second_octets = [0u8, 1, 2, 10, 100, 200, 254];
-
-    for second_octet in common_second_octets {
-        for third_octet in (0u8..=250).step_by(10) {
-            let ip1 = Ipv4Addr::new(first_octet, second_octet, third_octet, 1).to_string();
-            if seen.insert(ip1.clone()) {
-                hosts.push(ip1);
-            }
-            let ip2 = Ipv4Addr::new(first_octet, second_octet, third_octet, 254).to_string();
-            if seen.insert(ip2.clone()) {
-                hosts.push(ip2);
-            }
-            let ip3 = Ipv4Addr::new(
-                first_octet,
-                second_octet,
-                third_octet,
-                sampled_host_octet(first_octet, second_octet, third_octet, 0),
-            )
-            .to_string();
-            if seen.insert(ip3.clone()) {
-                hosts.push(ip3);
+/// Returns true when the host yields a TCP response (open or actively refused)
+/// on common ports, distinguishing dead/filtered hosts (timeouts) from live ones.
+fn host_is_reachable_tcp(addrs: &[IpAddr], timeout: Duration) -> bool {
+    for &port in LIVENESS_TCP_PORTS {
+        for ip in addrs {
+            let addr = SocketAddr::new(*ip, port);
+            match TcpStream::connect_timeout(&addr, timeout) {
+                Ok(_) => return true,
+                Err(error) => {
+                    // Connection refused => host is up and actively rejecting.
+                    if error.kind() == std::io::ErrorKind::ConnectionRefused {
+                        return true;
+                    }
+                }
             }
         }
     }
-
-    for second_octet in (0u8..=224).step_by(32) {
-        for third_octet in (0u8..=224).step_by(32) {
-            let ip1 = Ipv4Addr::new(first_octet, second_octet, third_octet, 1).to_string();
-            if seen.insert(ip1.clone()) {
-                hosts.push(ip1);
-            }
-            let ip2 = Ipv4Addr::new(
-                first_octet,
-                second_octet,
-                third_octet,
-                sampled_host_octet(first_octet, second_octet, third_octet, 1),
-            )
-            .to_string();
-            if seen.insert(ip2.clone()) {
-                hosts.push(ip2);
-            }
-        }
-    }
-
-    hosts
-}
-
-fn sampled_host_octet(first_octet: u8, second_octet: u8, third_octet: u8, salt: u8) -> u8 {
-    2 + ((u16::from(first_octet) * 31
-        + u16::from(second_octet) * 17
-        + u16::from(third_octet) * 13
-        + u16::from(salt) * 19)
-        % 252) as u8
-}
-
-fn expand_range(spec: &str) -> Result<Vec<String>> {
-    let (start, end) = spec
-        .split_once('-')
-        .ok_or_else(|| anyhow!("invalid range: {spec}"))?;
-    let start_ip = start
-        .parse::<Ipv4Addr>()
-        .map_err(|_| anyhow!("invalid start ip: {spec}"))?;
-
-    if let Ok(end_ip) = end.parse::<Ipv4Addr>() {
-        return expand_full_range(start_ip, end_ip);
-    }
-
-    let suffix = end
-        .parse::<u8>()
-        .map_err(|_| anyhow!("invalid end ip range: {spec}"))?;
-    let start_octets = start_ip.octets();
-    if start_octets[3] > suffix {
-        return Err(anyhow!("invalid short ip range: {spec}"));
-    }
-
-    let mut hosts = Vec::new();
-    for last in start_octets[3]..=suffix {
-        hosts.push(
-            Ipv4Addr::new(start_octets[0], start_octets[1], start_octets[2], last).to_string(),
-        );
-    }
-    Ok(hosts)
-}
-
-fn expand_full_range(start: Ipv4Addr, end: Ipv4Addr) -> Result<Vec<String>> {
-    let start = u32::from(start);
-    let end = u32::from(end);
-    if start > end {
-        return Err(anyhow!("invalid ip range"));
-    }
-    let count = u64::from(end - start) + 1;
-    if count > 1_048_576 {
-        return Err(anyhow!("ip range too large to expand safely"));
-    }
-
-    let mut hosts = Vec::with_capacity(count as usize);
-    for current in start..=end {
-        hosts.push(Ipv4Addr::from(current).to_string());
-    }
-    Ok(hosts)
-}
-
-fn looks_like_hostname(value: &str) -> bool {
-    value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
-}
-
-fn is_ipv4_range(value: &str) -> bool {
-    value
-        .split_once('-')
-        .map(|(start, _)| start.parse::<Ipv4Addr>().is_ok())
-        .unwrap_or(false)
-}
-
-fn append_unique(targets: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
-    use std::collections::HashSet;
-    let existing: HashSet<String> = targets.iter().cloned().collect();
-    targets.extend(values.into_iter().filter(|v| !existing.contains(v)));
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::targets::expand_alias;
     use std::net::{SocketAddr, TcpListener};
 
     #[test]
@@ -628,6 +373,109 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 protocol: "PING",
             }]
+        );
+    }
+
+    #[test]
+    fn resolves_hosts_once_before_port_scan_hot_path() {
+        // Hostname that maps to loopback; scanning multiple ports must not
+        // re-resolve per port (covered by resolve_hosts preprocessing).
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("test listener should bind on localhost");
+        let port = listener
+            .local_addr()
+            .expect("listener should have a local addr")
+            .port();
+        let handle = thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let resolved = resolve_hosts(&["localhost".to_string()]).expect("resolve localhost");
+        assert_eq!(resolved.len(), 1);
+        assert!(!resolved[0].addrs.is_empty());
+
+        let closed = if port == 1 { 2 } else { 1 };
+        let results = scan_tcp_ports(
+            &["localhost".to_string()],
+            &[port, closed],
+            Duration::from_millis(300),
+            4,
+        )
+        .expect("tcp scan should succeed");
+        assert!(
+            results
+                .iter()
+                .any(|open| open.host == "localhost" && open.port == port),
+            "expected open port {port} on localhost, got {results:?}"
+        );
+
+        let _ = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)));
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn liveness_marks_open_listener_host_alive_and_filters_dead() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        // Keep the listener alive for the duration of the probe.
+        let _listener = listener;
+
+        // 127.0.0.1 is always reachable (connection refused or open).
+        let probe = probe_live_hosts(
+            &["127.0.0.1".to_string(), "203.0.113.1".to_string()],
+            Duration::from_millis(200),
+            4,
+            false,
+        )
+        .expect("liveness probe should succeed");
+
+        assert!(probe.attempted);
+        assert!(
+            probe
+                .alive_hosts
+                .iter()
+                .any(|host| host.host == "127.0.0.1" && host.protocol == "ICMP"),
+            "127.0.0.1 should be alive: {:?}",
+            probe.alive_hosts
+        );
+        // 203.0.113.0/24 is TEST-NET-3 (documentation); should time out as dead.
+        assert!(
+            !probe
+                .alive_hosts
+                .iter()
+                .any(|host| host.host == "203.0.113.1"),
+            "documentation address should not be alive: {:?}",
+            probe.alive_hosts
+        );
+    }
+
+    #[test]
+    fn primary_liveness_path_does_not_spawn_ping_command() {
+        // Structural + behavioral pin: probe_live_hosts succeeds without
+        // requiring the external ping binary (TCP reachability under the hood).
+        let probe = probe_live_hosts(
+            &["127.0.0.1".to_string()],
+            Duration::from_millis(500),
+            2,
+            false,
+        )
+        .expect("tcp liveness must work without external ping");
+        assert!(probe.attempted);
+        assert_eq!(probe.alive_hosts[0].protocol, "ICMP");
+        // Source pin: production section (before tests) must use TCP helpers and
+        // must not shell out via std::process.
+        let source = include_str!("lib.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production section");
+        assert!(
+            production.contains("fn host_is_reachable_tcp"),
+            "primary liveness path should use TCP reachability helpers"
+        );
+        let forbidden = ["std", "process", "Command"].join("::");
+        assert!(
+            !production.contains(&forbidden),
+            "primary liveness path must not spawn external processes via {forbidden}"
         );
     }
 }

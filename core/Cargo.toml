@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 rscan-config = { path = "../config" }
- rscan-fingerprint = { path = "../fingerprint" }
+rscan-fingerprint = { path = "../fingerprint" }
 rscan-net = { path = "../net" }
 rscan-output = { path = "../output" }
 rscan-poc = { path = "../poc" }

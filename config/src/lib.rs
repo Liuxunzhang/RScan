@@ -6,7 +6,7 @@ use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const VERSION: &str = "2.0.1";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_OUTPUT_FILE: &str = "result.txt";
 pub const DEFAULT_MAIN_PORTS: &str = "21,22,23,80,81,110,135,139,143,389,443,445,502,873,993,995,1433,1521,3306,5432,5672,6379,7001,7687,8000,8005,8009,8080,8089,8443,9000,9042,9092,9200,10051,11211,15672,27017,61616";
 pub const DEFAULT_LOG_LEVEL: &str = "success";
@@ -638,10 +638,10 @@ pub enum ConfigError {
 }
 
 fn split_flag_value(token: &str) -> (&str, Option<String>) {
-    if let Some((flag, value)) = token.split_once('=') {
-        if flag.starts_with('-') {
-            return (flag, Some(value.to_string()));
-        }
+    if let Some((flag, value)) = token.split_once('=')
+        && flag.starts_with('-')
+    {
+        return (flag, Some(value.to_string()));
     }
     (token, None)
 }
@@ -794,7 +794,11 @@ fn append_target_specs(
     host_ports: &mut Vec<String>,
     value: &str,
 ) -> Result<(), ConfigError> {
-    for item in value.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
         append_target_spec(hosts, host_ports, item)?;
     }
     Ok(())
@@ -1194,10 +1198,15 @@ mod tests {
     #[test]
     fn validates_single_runtime_mode() {
         let config = AppConfig::from_tokens(["-h", "10.0.0.1"]).expect("config should parse");
-        config.validate_run_mode().expect("single host mode should pass");
+        config
+            .validate_run_mode()
+            .expect("single host mode should pass");
 
-        let config = AppConfig::from_tokens(["-u", "http://127.0.0.1"]).expect("config should parse");
-        config.validate_run_mode().expect("single url mode should pass");
+        let config =
+            AppConfig::from_tokens(["-u", "http://127.0.0.1"]).expect("config should parse");
+        config
+            .validate_run_mode()
+            .expect("single url mode should pass");
 
         let config = AppConfig::from_tokens(["-local"]).expect("config should parse");
         config.validate_run_mode().expect("local mode should pass");
@@ -1226,8 +1235,8 @@ mod tests {
             .expect_err("host and url should conflict");
         assert!(matches!(error, ConfigError::ConflictingScanModes));
 
-        let config = AppConfig::from_tokens(["-h", "10.0.0.1", "-local"])
-            .expect("config should parse");
+        let config =
+            AppConfig::from_tokens(["-h", "10.0.0.1", "-local"]).expect("config should parse");
         let error = config
             .validate_run_mode()
             .expect_err("host and local should conflict");

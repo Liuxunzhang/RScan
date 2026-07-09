@@ -192,8 +192,7 @@ fn extract_title(body: &str) -> String {
 fn normalize_whitespace(value: &str) -> String {
     value
         .trim()
-        .replace('\n', "")
-        .replace('\r', "")
+        .replace(['\n', '\r'], "")
         .replace("&nbsp;", " ")
         .chars()
         .take(MAX_TITLE_LENGTH)

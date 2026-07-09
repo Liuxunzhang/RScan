@@ -84,7 +84,7 @@ pub struct OutputManager {
 enum OutputSink {
     Text(BufWriter<File>),
     Json(BufWriter<File>),
-    Csv(csv::Writer<BufWriter<File>>),
+    Csv(Box<csv::Writer<BufWriter<File>>>),
 }
 
 impl OutputManager {
@@ -118,7 +118,7 @@ impl OutputManager {
                     .with_context(|| format!("failed to create {}", path.display()))?;
                 let mut writer = csv::Writer::from_writer(BufWriter::new(file));
                 writer.write_record(["Time", "Type", "Target", "Status", "Details"])?;
-                OutputSink::Csv(writer)
+                OutputSink::Csv(Box::new(writer))
             }
         };
 
